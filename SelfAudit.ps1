@@ -68,6 +68,7 @@ $ZipPath  = Join-Path $TempRoot "SelfAudit-$env:COMPUTERNAME-$Stamp.zip"
 $WebhookConfigFile = Join-Path $BaseDir 'WebhookUrl.txt'
 if (-not $WebhookFile -and (Test-Path -LiteralPath $WebhookConfigFile)) { $WebhookFile = $WebhookConfigFile }
 $script:WebhookValid = $false
+if ($null -eq $script:Webhook) { $script:Webhook = '' }
 $WinRoot = $env:SystemRoot.TrimEnd('\') + '\'
 $Findings = [System.Collections.Generic.List[object]]::new()
 $Meta = [ordered]@{}
@@ -285,7 +286,7 @@ function New-UploadResult([bool]$Ok,[string]$Status,[string]$Reason) { [pscustom
 function Send-Webhook {
     param([string]$Path,[string]$Summary)
     if ($NoUpload) { return (New-UploadResult $false 'skipped' 'upload disabled (-NoUpload)') }
-    if (-not $script:WebhookValid) { Write-Host '  [WARN] No valid webhook configured.' -ForegroundColor Yellow; return (New-UploadResult $false 'no_webhook' 'no valid webhook URL configured') }
+    if (-not $script:WebhookValid -or -not $script:Webhook) { Write-Host '  [WARN] No valid webhook configured.' -ForegroundColor Yellow; return (New-UploadResult $false 'no_webhook' 'no valid webhook URL configured') }
     if (-not (Test-Path -LiteralPath $Path)) { return (New-UploadResult $false 'no_file' 'archive not found') }
     $size = try { (Get-Item -LiteralPath $Path).Length } catch { 0 }
     if ($size -le 0) { return (New-UploadResult $false 'empty' 'archive is empty') }
@@ -302,7 +303,7 @@ function Send-Webhook {
             $bc = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($Path))
             $bc.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/zip')
             $fm.Add($bc,'files[0]',[IO.Path]::GetFileName($Path))
-            $r = $cl.PostAsync($Webhook,$fm).GetAwaiter().GetResult(); $c = [int]$r.StatusCode
+            $r = $cl.PostAsync($script:Webhook,$fm).GetAwaiter().GetResult(); $c = [int]$r.StatusCode
             if ($c -ge 200 -and $c -lt 300) { Write-Host '  [OK] Uploaded.' -ForegroundColor Green; return (New-UploadResult $true 'ok' 'uploaded') }
             $body = try { $r.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch { '' }
             if ($c -eq 413) { $lastReason = ('attachment too large for Discord ({0:N1} MB)' -f ($size/1MB)); Write-Host '  [WARN] HTTP 413: attachment too large.' -ForegroundColor Yellow; return (New-UploadResult $false 'too_large' $lastReason) }
@@ -344,8 +345,8 @@ function Test-WebhookUrl([string]$Url) {
 
 function Resolve-Webhook {
     if ($Webhook) {
-        $Webhook = $Webhook.Trim()
-        $script:WebhookValid = Test-WebhookUrl $Webhook
+        $script:Webhook = $Webhook.Trim()
+        $script:WebhookValid = Test-WebhookUrl $script:Webhook
         if (-not $script:WebhookValid) { Write-Host '  [WARN] -Webhook does not look like a Discord webhook URL.' -ForegroundColor Yellow }
         return
     }
@@ -353,20 +354,20 @@ function Resolve-Webhook {
         try {
             $raw = if ($WebhookFile -match '^https?://') { (Invoke-WebRequest -Uri $WebhookFile -UseBasicParsing -TimeoutSec 10 -EA Stop).Content } else { Get-Content -LiteralPath $WebhookFile -Raw -EA Stop }
             $cand = ($raw -split "`r?`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1)
-            if ($cand) { $Webhook = $cand.Trim() }
+            if ($cand) { $script:Webhook = $cand.Trim() }
         } catch { Write-Host "[WARN] Webhook file unreadable: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
-    if (-not $Webhook -and $DefaultWebhookUrl) {
+    if (-not $script:Webhook -and $DefaultWebhookUrl) {
         try {
             $raw = (Invoke-WebRequest -Uri $DefaultWebhookUrl -UseBasicParsing -TimeoutSec 10 -EA Stop).Content
             $c = ($raw -split "`r?`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1)
-            if ($c) { $Webhook = $c.Trim(); Set-Content -LiteralPath $WebhookCache -Value $Webhook -Encoding ASCII -EA SilentlyContinue }
+            if ($c) { $script:Webhook = $c.Trim(); Set-Content -LiteralPath $WebhookCache -Value $script:Webhook -Encoding ASCII -EA SilentlyContinue }
         } catch {
-            if (Test-Path $WebhookCache) { $Webhook = (Get-Content -LiteralPath $WebhookCache -Raw).Trim(); Write-Host '  [INFO] Using cached webhook.' -ForegroundColor DarkGray }
+            if (Test-Path $WebhookCache) { $script:Webhook = (Get-Content -LiteralPath $WebhookCache -Raw).Trim(); Write-Host '  [INFO] Using cached webhook.' -ForegroundColor DarkGray }
         }
     }
-    $script:WebhookValid = Test-WebhookUrl $Webhook
-    if ($Webhook -and -not $script:WebhookValid) { Write-Host '  [WARN] Resolved webhook URL is malformed; uploads will be skipped.' -ForegroundColor Yellow }
+    $script:WebhookValid = Test-WebhookUrl $script:Webhook
+    if ($script:Webhook -and -not $script:WebhookValid) { Write-Host '  [WARN] Resolved webhook URL is malformed; uploads will be skipped.' -ForegroundColor Yellow }
 }
 
 # ============================================================================
