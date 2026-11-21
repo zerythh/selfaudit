@@ -1102,7 +1102,15 @@ foreach ($p in (Get-Process -EA SilentlyContinue)) {
     $path = try { $p.Path } catch { '' }
     $nm = $p.ProcessName
     $hc = try { $p.HandleCount } catch { 0 }
-    $st = try { $p.StartTime.ToString('yyyy-MM-dd HH:mm') } catch { '' }
+    $st = ''
+try {
+    $startTime = $p.StartTime
+    if ($null -ne $startTime) {
+        $st = $startTime.ToString('yyyy-MM-dd HH:mm')
+    }
+} catch {
+    $st = ''
+}
     if ($nm.ToLower() -match '^(python|pythonw|py|node)$') { Add-Finding Detected 'Process' $nm "PID $($p.Id)" 'Script runtime running - real scanners terminate these' '' 'Close before a real session' -Score 15 -Confidence Medium }
     if (-not $path) { $procRows.Add([pscustomobject]@{Name=$nm;Pid=$p.Id;Path='';Verdict='Unreadable';Publisher='';Handles=$hc;Started=$st}); continue }
     $sig = Get-SigVerdict $path
@@ -1275,10 +1283,41 @@ Set-Phase 'Windows' 'Completed'
 
 try {
     $raw = (Invoke-WebRequest -Uri $Config.KnownDriversUrl -UseBasicParsing -TimeoutSec 10 -EA Stop).Content
-    $json = $raw | ConvertFrom-Json
-    $entries = if ($json -is [System.Array]) { $json } elseif ($json.PSObject.Properties['Verified']) { $json.Verified } else { @() }
-    foreach ($e in $entries) { if ($e.name) { $script:KnownDriversCache[$e.name.ToLower()]=$true }; if ($e.PSObject.Properties['KnownVulnerableSamples'] -and $e.KnownVulnerableSamples) { foreach ($s in $e.KnownVulnerableSamples) { if ($s.SHA256) { $script:KnownDriversHashCache[$s.SHA256.ToString().ToLower()]=$true } } } }
-} catch { Write-Host '  [WARN] lolDrivers unavailable' -ForegroundColor Yellow }
+
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = 67108864
+    $serializer.RecursionLimit = 100
+
+    $json = $serializer.DeserializeObject($raw)
+
+    $entries = if ($json -is [System.Array]) {
+        $json
+    } elseif ($json -is [System.Collections.IDictionary] -and $json.Contains('Verified')) {
+        $json['Verified']
+    } else {
+        @()
+    }
+
+    foreach ($e in $entries) {
+        if ($e -isnot [System.Collections.IDictionary]) { continue }
+
+        if ($e.Contains('name') -and $e['name']) {
+            $script:KnownDriversCache[$e['name'].ToLowerInvariant()] = $true
+        }
+
+        if ($e.Contains('KnownVulnerableSamples') -and $e['KnownVulnerableSamples']) {
+            foreach ($sample in $e['KnownVulnerableSamples']) {
+                if ($sample -is [System.Collections.IDictionary] -and $sample.Contains('SHA256') -and $sample['SHA256']) {
+                    $script:KnownDriversHashCache[$sample['SHA256'].ToString().ToLowerInvariant()] = $true
+                }
+            }
+        }
+    }
+} catch {
+    Write-Host '  [WARN] lolDrivers unavailable' -ForegroundColor Yellow
+}
 
 foreach ($d in (Get-CimInstance Win32_SystemDriver -EA SilentlyContinue)) {
     $pn = $d.PathName; if (-not $pn) { continue }
