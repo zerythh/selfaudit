@@ -1,7 +1,9 @@
 <#
   SelfAudit - static + live cheat / rootkit / forensics scanner.
   Webhook is pulled from a separate text file so it can be rotated without touching code.
-  Partial results are uploaded every ~45s during a run so a killed session still leaves evidence.
+  Reports are built and zipped in a unique temp directory and uploaded to Discord - nothing is
+  written to the Desktop. Partial results are uploaded every ~45s during a run so a killed
+  session still leaves evidence.
 #>
 [CmdletBinding()]
 param(
@@ -12,6 +14,7 @@ param(
     [switch]$NoReputation,
     [switch]$NoLive,
     [int]$LiveSeconds = 0,
+    [int]$MaxUploadMB = 8,
     [switch]$SelfExclude,
     [switch]$NoUpload,
     [switch]$NoPause,
@@ -58,9 +61,13 @@ try { New-Item -ItemType Directory -Path $DataRoot -Force -ErrorAction SilentlyC
 
 $ExePath = try { [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { '' }
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($ExePath) { Split-Path $ExePath -Parent } else { (Get-Location).Path }
-$outParent = if ($BaseDir -like "$env:TEMP*" -or $BaseDir -like '*\Temp\*') { [Environment]::GetFolderPath('Desktop') } else { $BaseDir }
-$OutDir = Join-Path $outParent "SelfAudit-$Stamp"
-$ZipPath = Join-Path ([IO.Path]::GetTempPath()) "SelfAudit-$env:COMPUTERNAME-$Stamp.zip"
+# Reports live only in a unique temp directory; nothing is written to the Desktop.
+$TempRoot = Join-Path ([IO.Path]::GetTempPath()) ('SelfAudit-' + [guid]::NewGuid().ToString('N'))
+$OutDir   = Join-Path $TempRoot "SelfAudit-$Stamp"
+$ZipPath  = Join-Path $TempRoot "SelfAudit-$env:COMPUTERNAME-$Stamp.zip"
+$WebhookConfigFile = Join-Path $BaseDir 'WebhookUrl.txt'
+if (-not $WebhookFile -and (Test-Path -LiteralPath $WebhookConfigFile)) { $WebhookFile = $WebhookConfigFile }
+$script:WebhookValid = $false
 $WinRoot = $env:SystemRoot.TrimEnd('\') + '\'
 $Findings = [System.Collections.Generic.List[object]]::new()
 $Meta = [ordered]@{}
@@ -74,11 +81,13 @@ $script:RepBudget = 15
 $Config = @{
     PESieveUrl      = 'https://github.com/hasherezade/pe-sieve/releases/latest/download/pe-sieve64.zip'
     KnownDriversUrl = 'https://www.loldrivers.io/api/drivers.json'
-    UploadLimitBytes = 24MB
+    UploadLimitBytes = 8MB
     LivePollSeconds = 2
     MaxRegions      = 60
     MaxRegionBytes  = 48MB
 }
+if ($MaxUploadMB -le 0) { $MaxUploadMB = 8 }
+$Config.UploadLimitBytes = [int64]$MaxUploadMB * 1MB
 
 # ============================================================================
 # Signatures
@@ -271,11 +280,19 @@ function New-Zip {
     } finally { $fs.Dispose() }
 }
 
+function New-UploadResult([bool]$Ok,[string]$Status,[string]$Reason) { [pscustomobject]@{ Ok=$Ok; Status=$Status; Reason=$Reason } }
+
 function Send-Webhook {
     param([string]$Path,[string]$Summary)
-    if ($NoUpload) { return $false }
-    if (-not $script:WebhookValid) { Write-Host '  [WARN] No valid webhook.' -ForegroundColor Yellow; return $false }
+    if ($NoUpload) { return (New-UploadResult $false 'skipped' 'upload disabled (-NoUpload)') }
+    if (-not $script:WebhookValid) { Write-Host '  [WARN] No valid webhook configured.' -ForegroundColor Yellow; return (New-UploadResult $false 'no_webhook' 'no valid webhook URL configured') }
+    if (-not (Test-Path -LiteralPath $Path)) { return (New-UploadResult $false 'no_file' 'archive not found') }
+    $size = try { (Get-Item -LiteralPath $Path).Length } catch { 0 }
+    if ($size -le 0) { return (New-UploadResult $false 'empty' 'archive is empty') }
+    if ($size -gt $Config.UploadLimitBytes) { Write-Host ("  [WARN] Archive is {0:N1} MB, above the configured {1} MB limit." -f ($size/1MB), $MaxUploadMB) -ForegroundColor Yellow }
+
     $payload = @{ username='SelfAudit'; content=$Summary; allowed_mentions=@{ parse=@() } } | ConvertTo-Json -Depth 4
+    $lastReason = 'unknown error'
     for ($n = 1; $n -le 3; $n++) {
         $cl = $null; $fm = $null
         try {
@@ -286,13 +303,22 @@ function Send-Webhook {
             $bc.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/zip')
             $fm.Add($bc,'files[0]',[IO.Path]::GetFileName($Path))
             $r = $cl.PostAsync($Webhook,$fm).GetAwaiter().GetResult(); $c = [int]$r.StatusCode
-            if ($c -ge 200 -and $c -lt 300) { Write-Host '  [OK] Uploaded.' -ForegroundColor Green; return $true }
-            if ($c -eq 429) { $w=5; try { $w=[int]$r.Headers.GetValues('Retry-After')|Select-Object -First 1 } catch {}; Start-Sleep ([Math]::Min(30,[Math]::Max(2,$w))); continue }
-            Write-Host "  [WARN] HTTP $c" -ForegroundColor Yellow; return $false
-        } catch { Write-Host "  [WARN] Attempt $n`: $($_.Exception.Message)" -ForegroundColor Yellow; Start-Sleep 3 }
-        finally { if ($fm) { $fm.Dispose() }; if ($cl) { $cl.Dispose() } }
+            if ($c -ge 200 -and $c -lt 300) { Write-Host '  [OK] Uploaded.' -ForegroundColor Green; return (New-UploadResult $true 'ok' 'uploaded') }
+            $body = try { $r.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch { '' }
+            if ($c -eq 413) { $lastReason = ('attachment too large for Discord ({0:N1} MB)' -f ($size/1MB)); Write-Host '  [WARN] HTTP 413: attachment too large.' -ForegroundColor Yellow; return (New-UploadResult $false 'too_large' $lastReason) }
+            if ($c -eq 400) { $lastReason = "Discord rejected the upload (HTTP 400)$(if($body){' - ' + $body.Substring(0,[Math]::Min(180,$body.Length))})"; Write-Host "  [WARN] $lastReason" -ForegroundColor Yellow; return (New-UploadResult $false 'bad_request' $lastReason) }
+            if ($c -eq 401 -or $c -eq 403) { $lastReason = "webhook unauthorised or revoked (HTTP $c)"; Write-Host "  [WARN] $lastReason" -ForegroundColor Yellow; return (New-UploadResult $false 'unauthorised' $lastReason) }
+            if ($c -eq 404) { $lastReason = 'webhook not found (HTTP 404) - deleted or wrong URL'; Write-Host "  [WARN] $lastReason" -ForegroundColor Yellow; return (New-UploadResult $false 'not_found' $lastReason) }
+            if ($c -eq 429) { $w = 5; try { $w = [int]($r.Headers.GetValues('Retry-After') | Select-Object -First 1) } catch {}; $lastReason='rate limited (HTTP 429)'; $w = [Math]::Min(30,[Math]::Max(2,$w)); Write-Host "  [WARN] Rate limited, retrying in ${w}s." -ForegroundColor Yellow; Start-Sleep $w; continue }
+            if ($c -ge 500) { $lastReason = "Discord server error (HTTP $c)"; Write-Host "  [WARN] $lastReason, retrying." -ForegroundColor Yellow; Start-Sleep 3; continue }
+            $lastReason = "unexpected HTTP $c"; Write-Host "  [WARN] $lastReason" -ForegroundColor Yellow; return (New-UploadResult $false 'http_error' $lastReason)
+        } catch {
+            $lastReason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+            Write-Host "  [WARN] Attempt $n failed: $lastReason" -ForegroundColor Yellow
+            if ($n -lt 3) { Start-Sleep 3 }
+        } finally { if ($fm) { $fm.Dispose() }; if ($cl) { $cl.Dispose() } }
     }
-    return $false
+    return (New-UploadResult $false 'network' $lastReason)
 }
 
 $script:LastPartial = Get-Date
@@ -301,35 +327,46 @@ function Send-Partial {
     if ($NoUpload -or -not $script:WebhookValid) { return }
     if (((Get-Date) - $script:LastPartial).TotalSeconds -lt 45) { return }
     $script:LastPartial = Get-Date
+    $p = Join-Path $TempRoot ("partial-{0}-{1}.zip" -f $Stamp, (Get-Random))
     try {
-        $p = Join-Path $env:TEMP ("partial_$(Get-Random).zip")
         New-Zip -Dest $p -TextOnly
         Send-Webhook -Path $p -Summary "**PARTIAL - $Tag** | ``$env:COMPUTERNAME`` / ``$env:USERNAME`` | still running" | Out-Null
-        Remove-Item $p -Force -ErrorAction SilentlyContinue
-    } catch {}
+    } catch {} finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
 }
 
 # ============================================================================
 # Webhook resolution
 # ============================================================================
+function Test-WebhookUrl([string]$Url) {
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
+    return $Url -match '^https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/\d{5,}/[\w\-]+$'
+}
+
 function Resolve-Webhook {
-    if ($Webhook) { return }
+    if ($Webhook) {
+        $Webhook = $Webhook.Trim()
+        $script:WebhookValid = Test-WebhookUrl $Webhook
+        if (-not $script:WebhookValid) { Write-Host '  [WARN] -Webhook does not look like a Discord webhook URL.' -ForegroundColor Yellow }
+        return
+    }
     if ($WebhookFile) {
         try {
             $raw = if ($WebhookFile -match '^https?://') { (Invoke-WebRequest -Uri $WebhookFile -UseBasicParsing -TimeoutSec 10 -EA Stop).Content } else { Get-Content -LiteralPath $WebhookFile -Raw -EA Stop }
-            $Webhook = ($raw -split "`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1).Trim()
+            $cand = ($raw -split "`r?`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1)
+            if ($cand) { $Webhook = $cand.Trim() }
         } catch { Write-Host "[WARN] Webhook file unreadable: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
     if (-not $Webhook -and $DefaultWebhookUrl) {
         try {
             $raw = (Invoke-WebRequest -Uri $DefaultWebhookUrl -UseBasicParsing -TimeoutSec 10 -EA Stop).Content
-            $c = ($raw -split "`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1).Trim()
-            if ($c) { $Webhook = $c; Set-Content -LiteralPath $WebhookCache -Value $c -Encoding ASCII -EA SilentlyContinue }
+            $c = ($raw -split "`r?`n" | Where-Object { $_ -match 'discord(app)?\.com/api/webhooks/' } | Select-Object -First 1)
+            if ($c) { $Webhook = $c.Trim(); Set-Content -LiteralPath $WebhookCache -Value $Webhook -Encoding ASCII -EA SilentlyContinue }
         } catch {
             if (Test-Path $WebhookCache) { $Webhook = (Get-Content -LiteralPath $WebhookCache -Raw).Trim(); Write-Host '  [INFO] Using cached webhook.' -ForegroundColor DarkGray }
         }
     }
-    $script:WebhookValid = $Webhook -match '^https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/\d+/[\w\-]+'
+    $script:WebhookValid = Test-WebhookUrl $Webhook
+    if ($Webhook -and -not $script:WebhookValid) { Write-Host '  [WARN] Resolved webhook URL is malformed; uploads will be skipped.' -ForegroundColor Yellow }
 }
 
 # ============================================================================
@@ -350,10 +387,14 @@ if (-not $isAdmin) {
 }
 
 $made = $false
-foreach ($c in @($OutDir, (Join-Path ([Environment]::GetFolderPath('Desktop')) "SelfAudit-$Stamp"), (Join-Path ([IO.Path]::GetTempPath()) "SelfAudit-$Stamp"))) {
-    try { New-Item -ItemType Directory -Path $c -Force -ErrorAction Stop | Out-Null; $OutDir = $c; $made = $true; break } catch {}
+try { New-Item -ItemType Directory -Path $OutDir -Force -ErrorAction Stop | Out-Null; $made = $true } catch {}
+if (-not $made) {
+    $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ('SelfAudit-' + [guid]::NewGuid().ToString('N'))
+    $OutDir   = Join-Path $TempRoot "SelfAudit-$Stamp"
+    $ZipPath  = Join-Path $TempRoot "SelfAudit-$env:COMPUTERNAME-$Stamp.zip"
+    try { New-Item -ItemType Directory -Path $OutDir -Force -ErrorAction Stop | Out-Null; $made = $true } catch {}
 }
-if (-not $made) { Write-Host '[ERROR] No writable output folder.' -ForegroundColor Red; exit 1 }
+if (-not $made) { Write-Host '[ERROR] No writable temporary folder.' -ForegroundColor Red; exit 1 }
 $ErrorLogPath = Join-Path $OutDir "SelfAudit-errors-$Stamp.log"
 try { Set-Content -LiteralPath $ErrorLogPath -Value "SelfAudit error log - $Stamp" -Encoding UTF8 } catch {}
 
@@ -1857,12 +1898,25 @@ $sum = @(
     if ($crit.Count) { '**Top:** ' + (($crit | Select-Object -First 6 | ForEach-Object { "$($_.Category)/$($_.Name)" }) -join '; ') }
 ) -join "`n"
 
+$archiveOk = $false
 try {
     New-Zip -Dest $ZipPath
-    if ((Get-Item $ZipPath).Length -gt $Config.UploadLimitBytes) { New-Zip -Dest $ZipPath -TextOnly }
-    Write-Host "  [INFO] Archive: $ZipPath" -ForegroundColor Cyan
-    if (-not (Send-Webhook -Path $ZipPath -Summary $sum)) { Write-Host "  [INFO] Zip kept at: $ZipPath" -ForegroundColor Gray }
+    $archiveOk = Test-Path -LiteralPath $ZipPath
+    if ($archiveOk -and (Get-Item -LiteralPath $ZipPath).Length -gt $Config.UploadLimitBytes) { New-Zip -Dest $ZipPath -TextOnly }
 } catch { Write-AuditError -Record $_ -Stage 'Packaging' }
+
+$upload = if ($archiveOk) { Send-Webhook -Path $ZipPath -Summary $sum } else { New-UploadResult $false 'no_archive' 'archive could not be created' }
+
+if ($upload.Ok) {
+    $freed = $true
+    try { Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction Stop } catch { $freed = $false }
+    Write-Host ("  [OK] Report uploaded to Discord as {0}." -f [IO.Path]::GetFileName($ZipPath)) -ForegroundColor Green
+    if (-not $freed) { Microsoft.PowerShell.Utility\Write-Host "  [INFO] Upload succeeded but cleanup failed: $TempRoot" -ForegroundColor Yellow }
+} else {
+    Microsoft.PowerShell.Utility\Write-Host "  [FAIL] Discord upload failed: $($upload.Reason)" -ForegroundColor Red
+    Microsoft.PowerShell.Utility\Write-Host "  [INFO] Archive kept for recovery: $ZipPath" -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host "  [INFO] Report folder kept: $OutDir" -ForegroundColor DarkGray
+}
 
 if (-not $NoPause) { Write-Host "`nDone. Press Enter to exit." -ForegroundColor DarkGray; [void][Console]::ReadLine() }
 exit 0
