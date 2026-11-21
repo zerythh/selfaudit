@@ -23,6 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
