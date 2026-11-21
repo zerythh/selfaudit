@@ -975,7 +975,7 @@ foreach ($d in (Get-CimInstance Win32_PnPEntity -EA SilentlyContinue | Where-Obj
 }
 
 try {
-    $hdr = (Invoke-WebRequest -Uri 'https://www.cloudflare.com' -Method Head -TimeoutSec 6 -EA Stop).Headers
+    $hdr = (Invoke-WebRequest -UseBasicParsing -Uri 'https://www.cloudflare.com' -Method Head -TimeoutSec 6 -EA Stop).Headers
     if ($hdr.Date) { $skew = [Math]::Abs(((Get-Date).ToUniversalTime() - $hdr.Date.ToUniversalTime()).TotalMinutes); $Meta['clockSkewMinutes'] = [int]$skew; if ($skew -gt 5) { Add-Finding Detected 'Tamper' 'System clock' 'ClockSkew' "Clock is off by $([int]$skew) minutes - timeline evidence is unreliable" '' 'Sync the clock' -Score 18 -Confidence High } }
 } catch {}
 Set-Phase 'Security posture' 'Completed'
