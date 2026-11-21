@@ -26,11 +26,12 @@ $ErrorActionPreference = 'Continue'
 $PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $ScanStart = Get-Date
-$RepoBase = 'https://raw.githubusercontent.com/zeryth/selfaudit/main'
+$RepoBase = 'https://raw.githubusercontent.com/zerythh/selfaudit/refs/heads/main'
 $DefaultWebhookUrl = "$RepoBase/WebhookUrl.txt"
 $DataRoot = Join-Path $env:LOCALAPPDATA 'SelfAudit'
 $ToolRoot = Join-Path $DataRoot 'Tools'
@@ -55,7 +56,7 @@ $script:RepBudget = 15
 
 $Config = @{
     PESieveUrl      = 'https://github.com/hasherezade/pe-sieve/releases/latest/download/pe-sieve64.zip'
-    KnownDriversUrl = 'https://raw.githubusercontent.com/Neo23x0/LolDrivers/master/loldrivers.json'
+    KnownDriversUrl = 'https://www.loldrivers.io/api/drivers.json'
     UploadLimitBytes = 24MB
     LivePollSeconds = 2
     MaxRegions      = 60
@@ -798,7 +799,6 @@ function Get-SigVerdict([string]$Path) {
     }
     $sig = try { Get-AuthenticodeSignature -LiteralPath $Path -EA Stop } catch { $null }
     $cert = if ($sig) { $sig.SignerCertificate } else { $null }
-    if (-not $cert) { try { $raw=[Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($Path); if ($raw) { $cert=[Security.Cryptography.X509Certificates.X509Certificate2]::new($raw) } } catch {} }
     $vi2 = try { (Get-Item -LiteralPath $Path).VersionInfo } catch { $null }
     if ($vi2 -and $vi2.CompanyName) { $r.Publisher = $vi2.CompanyName }
     if (-not $cert) { $SigCache[$Path]=$r; return $r }
@@ -894,25 +894,25 @@ function Get-Tool {
 }
 
 function Invoke-BinaryEvaluation {
-    param([string]$Name,[string]$Path,[string]$Pid = '',[string]$Source = 'Process')
+    param([string]$Name,[string]$Path,[string]$ProcessId = '',[string]$Source = 'Process')
     if (-not $Path) { return }
     $sig = Get-SigVerdict $Path
     $hash = Get-CachedHash $Path
-    if ($hash -and $CheatHashes.ContainsKey($hash)) { Add-Finding Detected $Source $Name "PID $Pid" "Known cheat hash: $($CheatHashes[$hash])" '' 'Verify hash and source' -Score 70 -Confidence High -Evidence @("SHA256 $hash"); return }
-    if ($hash -and $UnconfirmedHashes.ContainsKey($hash)) { Add-Finding Review $Source $Name "PID $Pid" "Unconfirmed sample hash: $($UnconfirmedHashes[$hash])" '' 'Confirm manually' -Score 25 -Confidence Medium -Evidence @("SHA256 $hash"); return }
+    if ($hash -and $CheatHashes.ContainsKey($hash)) { Add-Finding Detected $Source $Name "PID $ProcessId" "Known cheat hash: $($CheatHashes[$hash])" '' 'Verify hash and source' -Score 70 -Confidence High -Evidence @("SHA256 $hash"); return }
+    if ($hash -and $UnconfirmedHashes.ContainsKey($hash)) { Add-Finding Review $Source $Name "PID $ProcessId" "Unconfirmed sample hash: $($UnconfirmedHashes[$hash])" '' 'Confirm manually' -Score 25 -Confidence Medium -Evidence @("SHA256 $hash"); return }
     $str = Get-CheatStrings $Path
-    if ($str -and $str.Strong) { Add-Finding Detected $Source $Name "PID $Pid" "Cheat string signature: $($str.Family) [$($str.Markers -join ', ')]" '' 'Verify origin' -Score 55 -Confidence High -Evidence @("Markers: $($str.Markers -join ', ')"); return }
+    if ($str -and $str.Strong) { Add-Finding Detected $Source $Name "PID $ProcessId" "Cheat string signature: $($str.Family) [$($str.Markers -join ', ')]" '' 'Verify origin' -Score 55 -Confidence High -Evidence @("Markers: $($str.Markers -join ', ')"); return }
     $strong = Test-StrongKeyword $Name
-    if ($strong) { Add-Finding Detected $Source $Name "PID $Pid" "Strong cheat keyword in name: $strong" '' 'A name match alone is not proof' -Score 30 -Confidence Medium -Evidence @("Keyword '$strong'"); return }
-    if ($str) { Add-Finding Review $Source $Name "PID $Pid" "Single string marker: $($str.Family) [$($str.Markers -join ', ')]" '' '' -Score 12 -Confidence Low; return }
+    if ($strong) { Add-Finding Detected $Source $Name "PID $ProcessId" "Strong cheat keyword in name: $strong" '' 'A name match alone is not proof' -Score 30 -Confidence Medium -Evidence @("Keyword '$strong'"); return }
+    if ($str) { Add-Finding Review $Source $Name "PID $ProcessId" "Single string marker: $($str.Family) [$($str.Markers -join ', ')]" '' '' -Score 12 -Confidence Low; return }
     $weak = Get-KeywordMatch $Name
-    if ($weak) { Add-Finding Review $Source $Name "PID $Pid" "Weak cheat keyword in name: $weak" '' '' -Score 10 -Confidence Low; return }
+    if ($weak) { Add-Finding Review $Source $Name "PID $ProcessId" "Weak cheat keyword in name: $weak" '' '' -Score 10 -Confidence Low; return }
     if ($sig.Verdict -eq 'Valid' -or $Path -match '\\Program Files') { return }
-    if (Test-GamingAllowlist $Name) { Add-Finding Info $Source $Name "PID $Pid" "Unsigned but allowlisted gaming software" '' '' -Score 0; return }
+    if (Test-GamingAllowlist $Name) { Add-Finding Info $Source $Name "PID $ProcessId" "Unsigned but allowlisted gaming software" '' '' -Score 0; return }
     $rep = if ($hash -and -not $NoReputation) { Get-HashReputation $hash } else { $null }
-    if ($rep -and $rep.Verdict -eq 'malicious') { Add-Finding Detected $Source $Name "PID $Pid" "Reputation hit: $($rep.Detail)" '' 'Check the source' -Score 55 -Confidence High -Evidence @($rep.Detail,"SHA256 $hash"); return }
-    if ($rep -and $rep.Verdict -eq 'suspicious') { Add-Finding Detected $Source $Name "PID $Pid" "Reputation: $($rep.Detail)" '' 'Check the source' -Score 30 -Confidence Medium; return }
-    Add-Finding Detected $Source $Name "PID $Pid" "Unsigned binary, unknown reputation ($($sig.Verdict))" '' 'Review the publisher and origin' -Score 20 -Confidence Low -Evidence @("Signature: $($sig.Verdict)")
+    if ($rep -and $rep.Verdict -eq 'malicious') { Add-Finding Detected $Source $Name "PID $ProcessId" "Reputation hit: $($rep.Detail)" '' 'Check the source' -Score 55 -Confidence High -Evidence @($rep.Detail,"SHA256 $hash"); return }
+    if ($rep -and $rep.Verdict -eq 'suspicious') { Add-Finding Detected $Source $Name "PID $ProcessId" "Reputation: $($rep.Detail)" '' 'Check the source' -Score 30 -Confidence Medium; return }
+    Add-Finding Detected $Source $Name "PID $ProcessId" "Unsigned binary, unknown reputation ($($sig.Verdict))" '' 'Review the publisher and origin' -Score 20 -Confidence Low -Evidence @("Signature: $($sig.Verdict)")
 }
 
 # ============================================================================
@@ -976,7 +976,14 @@ foreach ($d in (Get-CimInstance Win32_PnPEntity -EA SilentlyContinue | Where-Obj
 
 try {
     $hdr = (Invoke-WebRequest -UseBasicParsing -Uri 'https://www.cloudflare.com' -Method Head -TimeoutSec 6 -EA Stop).Headers
-    if ($hdr.Date) { $skew = [Math]::Abs(((Get-Date).ToUniversalTime() - $hdr.Date.ToUniversalTime()).TotalMinutes); $Meta['clockSkewMinutes'] = [int]$skew; if ($skew -gt 5) { Add-Finding Detected 'Tamper' 'System clock' 'ClockSkew' "Clock is off by $([int]$skew) minutes - timeline evidence is unreliable" '' 'Sync the clock' -Score 18 -Confidence High } }
+    if ($hdr.Date) {
+        try {
+            $serverDate = [DateTimeOffset]::Parse([string]$hdr.Date).UtcDateTime
+            $skew = [Math]::Abs(((Get-Date).ToUniversalTime() - $serverDate).TotalMinutes)
+            $Meta['clockSkewMinutes'] = [int]$skew
+            if ($skew -gt 5) { Add-Finding Detected 'Tamper' 'System clock' 'ClockSkew' "Clock is off by $([int]$skew) minutes - timeline evidence is unreliable" '' 'Sync the clock' -Score 18 -Confidence High }
+        } catch { }
+    }
 } catch {}
 Set-Phase 'Security posture' 'Completed'
 
@@ -996,7 +1003,7 @@ try { $pub = (Invoke-RestMethod 'https://api.ipify.org?format=json' -TimeoutSec 
 try { $s = Get-ItemProperty 'HKCU:\Software\Valve\Steam' -EA Stop; if ($s.AutoLoginUser) { Add-IdLine "Steam: $($s.AutoLoginUser)" }; $a2 = Get-ItemProperty 'HKCU:\Software\Valve\Steam\ActiveProcess' -EA SilentlyContinue; if ($a2 -and $a2.ActiveUser) { Add-IdLine "SteamID64: $($a2.ActiveUser)" } } catch {}
 try {
     $ldb = Join-Path $env:APPDATA 'discord\Local Storage\leveldb'
-    if (Test-Path $ldb) { $f2 = @(); foreach ($f in (Get-ChildItem $ldb -File -EA SilentlyContinue | Select-Object -First 20)) { try { $t = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($f.FullName)); foreach ($m in [regex]::Matches($t,'"user_id":"(\d{17,20})"')) { $f2 += $m.Groups[1].Value } } catch {} }; $f2 = @($f2 | Select-Object -Unique -First 3); if ($f2.Count) { Add-IdLine "Discord IDs: $($f2 -join ', ')" } }
+    if (Test-Path $ldb) { $f2 = @(); foreach ($f in (Get-ChildItem $ldb -File -EA SilentlyContinue | Select-Object -First 20)) { try { $fs = [IO.File]::Open($f.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete); try { $buf = New-Object byte[] ([int]$fs.Length); $null = $fs.Read($buf,0,$buf.Length); $t = [Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Dispose() }; foreach ($m in [regex]::Matches($t,'"user_id":"(\d{17,20})"')) { $f2 += $m.Groups[1].Value } } catch { if ($Error.Count -gt 0) { $Error.RemoveAt(0) } } }; $f2 = @($f2 | Select-Object -Unique -First 3); if ($f2.Count) { Add-IdLine "Discord IDs: $($f2 -join ', ')" } }
 } catch {}
 try { $idLines | Set-Content -LiteralPath (Join-Path $OutDir 'identity.txt') -Encoding UTF8 -EA Stop; Set-Phase 'Identity' 'Completed' } catch { Set-Phase 'Identity' 'Failed' }
 
@@ -1041,7 +1048,7 @@ foreach ($p in (Get-Process -EA SilentlyContinue)) {
     $sig = Get-SigVerdict $path
     if ($sig.Verdict -eq 'Valid' -and $path.StartsWith($WinRoot,'OrdinalIgnoreCase')) { $procRows.Add([pscustomobject]@{Name=$nm;Pid=$p.Id;Path=$path;Verdict='Valid';Publisher=$sig.Publisher;Handles=$hc;Started=$st}); continue }
     if ($SystemNames -contains $nm.ToLower() -and -not $path.StartsWith($WinRoot,'OrdinalIgnoreCase')) { Add-Finding Detected 'Process' "$nm (masquerade)" $path 'System binary name outside C:\Windows' '' 'Rename or move it' -Score 35 -Confidence High }
-    Invoke-BinaryEvaluation -Name $nm -Path $path -Pid $p.Id
+    Invoke-BinaryEvaluation -Name $nm -Path $path -ProcessId $p.Id
     $procRows.Add([pscustomobject]@{Name=$nm;Pid=$p.Id;Path=$path;Verdict=$sig.Verdict;Publisher=$sig.Publisher;Handles=$hc;Started=$st})
 }
 try { $procRows | Export-Csv -LiteralPath (Join-Path $OutDir 'process_inventory.csv') -NoTypeInformation -Encoding UTF8 -EA Stop; Set-Phase 'Process inventory' 'Completed' } catch { Set-Phase 'Process inventory' 'Partial' }
@@ -1075,7 +1082,7 @@ Set-Phase 'Loaded modules' 'Completed'
 # ============================================================================
 Set-AuditProgress 27 'Self-audit' 'Analysing process memory and scanning regions...'
 Write-Host "`n=== Memory / injection / rule scan ===" -ForegroundColor Magenta
-$roblox = @(Get-Process -Name RobloxPlayerBeta,RobloxPlayer,Roblox -EA SilentlyContinue)
+$roblox = @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -in @('RobloxPlayerBeta','RobloxPlayer','Roblox') })
 if ($roblox.Count -gt 0) {
     $tp = [Collections.Generic.HashSet[uint32]]::new(); foreach ($r in $roblox) { [void]$tp.Add([uint32]$r.Id) }
     $hs = @{}
@@ -1095,11 +1102,11 @@ foreach ($p in (Get-Process -EA SilentlyContinue | Where-Object { $_.Id -gt 4 -a
     foreach ($h in [SA.N]::Hollow($p.Id, $p.ProcessName)) { Add-Finding Detected 'Injection' $h.Name "PID $($h.Pid)" ("Private executable PE at 0x{0:X}" -f $h.Base) '' 'Manual-mapped image' -Score 30 -Confidence High }
 }
 
-function Test-RobloxThreads { foreach ($rp in @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue)) { try { if ([SA.N]::Modules($rp.Id).Count -eq 0) { continue }; foreach ($t in @([SA.N]::Threads($rp.Id) | Where-Object { -not $_.Backed })) { Add-Finding Detected 'Thread' "Thread $($t.Tid)" "PID $($rp.Id)" ("Start 0x{0:X} outside every module" -f $t.Start) '' 'Unbacked thread start is a strong executor signal' -Score 45 -Confidence High } } catch {} } }
-function Test-RobloxRegions { foreach ($rp in @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue)) { try { $r = @([SA.N]::Regions($rp.Id, 20000) | Where-Object { $_.Rwx }); if ($r.Count) { Add-Finding Review 'Memory' "RWX regions PID $($rp.Id)" 'RobloxPlayerBeta' "$($r.Count) RWX region(s)" '' 'High private RWX counts are worth a look' -Score 8 -Confidence Low } } catch {} } }
+function Test-RobloxThreads { foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) { try { if ([SA.N]::Modules($rp.Id).Count -eq 0) { continue }; foreach ($t in @([SA.N]::Threads($rp.Id) | Where-Object { -not $_.Backed })) { Add-Finding Detected 'Thread' "Thread $($t.Tid)" "PID $($rp.Id)" ("Start 0x{0:X} outside every module" -f $t.Start) '' 'Unbacked thread start is a strong executor signal' -Score 45 -Confidence High } } catch {} } }
+function Test-RobloxRegions { foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) { try { $r = @([SA.N]::Regions($rp.Id, 20000) | Where-Object { $_.Rwx }); if ($r.Count) { Add-Finding Review 'Memory' "RWX regions PID $($rp.Id)" 'RobloxPlayerBeta' "$($r.Count) RWX region(s)" '' 'High private RWX counts are worth a look' -Score 8 -Confidence Low } } catch {} } }
 function Test-RobloxHooks {
     $tg = @(@{M='ntdll.dll';F='NtReadVirtualMemory'},@{M='ntdll.dll';F='NtWriteVirtualMemory'},@{M='ntdll.dll';F='NtProtectVirtualMemory'},@{M='ntdll.dll';F='NtQuerySystemInformation'},@{M='kernel32.dll';F='VirtualProtect'},@{M='kernel32.dll';F='CreateRemoteThread'})
-    foreach ($rp in @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue)) {
+    foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) {
         $h = [SA.N]::OpenProcess(0x410,$false,[uint32]$rp.Id); if ($h -eq [IntPtr]::Zero) { continue }
         try {
             foreach ($t in $tg) { try {
@@ -1117,7 +1124,7 @@ function Test-RobloxHooks {
     }
 }
 function Test-RobloxIat {
-    foreach ($rp in @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue)) {
+    foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) {
         try {
             $exe = $rp.MainModule.FileName; if (-not (Test-Path $exe)) { continue }
             $mods = [SA.N]::Modules($rp.Id); if ($mods.Count -eq 0) { continue }
@@ -1396,7 +1403,9 @@ foreach ($root in @((Join-Path $env:USERPROFILE 'Downloads'), ([Environment]::Ge
     if (-not (Test-Path $root)) { continue }
     foreach ($f in (Get-ChildItem $root -File -Recurse -Depth 1 -EA SilentlyContinue | Where-Object { $_.Extension -in '.exe','.dll','.sys','.zip','.rar','.7z','.lua','.py','.msi','.ps1','.bat','.txt' })) {
         $Stats.Downloads++; $ts = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm'); $timeline.Add("$ts | FILE | $($f.FullName)")
-        $z = try { Get-Content -LiteralPath "$($f.FullName):Zone.Identifier" -EA Stop } catch { $null }
+        $z = $null
+        $zone = Get-Item -LiteralPath $f.FullName -Stream * -EA SilentlyContinue | Where-Object { $_.Stream -eq 'Zone.Identifier' }
+        if ($zone) { $z = Get-Content -LiteralPath $f.FullName -Stream Zone.Identifier -EA SilentlyContinue }
         if ($z) { $hu = ($z | Where-Object { $_ -match '^HostUrl=' }) -replace '^HostUrl=',''; $hit = Get-KeywordMatch "$hu $($f.Name)"; if ($hit -and $hu -match 'https?://') { Add-Finding Review 'Download origin' $f.Name $f.FullName "Downloaded from a cheat host ($hit): $hu" $ts 'Review the source' -Score 20 -Confidence Medium -Timeline @($ts) } }
         $nh = Get-KeywordMatch $f.Name; if ($nh) { Add-Finding Review 'Download name' $f.Name $f.FullName "Filename matches '$nh'" $ts '' -Score 12 -Confidence Low }
     }
@@ -1460,10 +1469,12 @@ $hive = Join-Path $WinRoot 'AppCompat\Programs\Amcache.hve'
 $amState = 'Failed'; $amHits = [System.Collections.Generic.List[string]]::new()
 if (Test-Path $hive) {
     $cp = Join-Path $env:TEMP ("am_$(Get-Random).hve")
+    $amHiveLoaded = $false
     try {
         $src = [IO.File]::Open($hive,'Open','Read','ReadWrite'); try { $dst=[IO.File]::Create($cp); try { $src.CopyTo($dst) } finally { $dst.Dispose() } } finally { $src.Dispose() }
         & reg.exe load 'HKLM\SATmp' $cp 2>$null | Out-Null
-        if (Test-Path 'HKLM:\SATmp\Root\File') {
+        $amHiveLoaded = ($LASTEXITCODE -eq 0)
+        if ($amHiveLoaded -and (Test-Path 'HKLM:\SATmp\Root\File')) {
             $sw = [Diagnostics.Stopwatch]::StartNew()
             foreach ($vol in (Get-ChildItem 'HKLM:\SATmp\Root\File' -EA SilentlyContinue)) {
                 if ($sw.Elapsed.TotalSeconds -gt 25) { break }
@@ -1478,7 +1489,20 @@ if (Test-Path $hive) {
             }
             $amState = 'Completed'
         } else { $amState = 'Partial' }
-    } catch { $amState = 'Failed' } finally { & reg.exe unload 'HKLM\SATmp' 2>$null | Out-Null; [gc]::Collect(); Start-Sleep -Milliseconds 150; Remove-Item -LiteralPath $cp -Force -EA SilentlyContinue }
+    } catch { $amState = 'Failed' } finally {
+        if ($amHiveLoaded) {
+            $unloaded = $false
+            for ($tryUnload = 0; $tryUnload -lt 3 -and -not $unloaded; $tryUnload++) {
+                & reg.exe unload 'HKLM\SATmp' 2>$null | Out-Null
+                $unloaded = ($LASTEXITCODE -eq 0) -or -not (Test-Path 'HKLM:\SATmp')
+                if (-not $unloaded) { [gc]::Collect(); Start-Sleep -Milliseconds 300 }
+            }
+            if ($unloaded) { Remove-Item -LiteralPath $cp -Force -EA SilentlyContinue }
+            else { Write-Host "  [WARN] Amcache temporary hive could not be unloaded; leaving its temporary copy at $cp" -ForegroundColor Yellow }
+        } elseif (Test-Path -LiteralPath $cp) {
+            Remove-Item -LiteralPath $cp -Force -EA SilentlyContinue
+        }
+    }
     try { $amHits | Set-Content -LiteralPath (Join-Path $OutDir 'amcache_hits.txt') -Encoding UTF8 -EA Stop } catch {}
 }
 Set-Phase 'Amcache' $amState
@@ -1491,14 +1515,24 @@ function Get-SrumUsage {
         try {
             New-Item -ItemType Directory -Path (Join-Path $ToolRoot 'Esent') -Force | Out-Null
             $nupkg = Join-Path $env:TEMP "esent_$(Get-Random).zip"
-            Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Isam.Esent.Interop/2.6.0' -OutFile $nupkg -UseBasicParsing -TimeoutSec 30 -EA Stop
+            $packageId = 'microsoft.isam.esent.interop'
+            $indexUrl = "https://api.nuget.org/v3-flatcontainer/$packageId/index.json"
+            $versionIndex = (Invoke-RestMethod -Uri $indexUrl -TimeoutSec 20 -EA Stop).versions
+            $stableVersions = @($versionIndex | Where-Object { $_ -notmatch '-' })
+            if (-not $stableVersions.Count) { return $null }
+            $packageVersion = $stableVersions[-1]
+            $packageUrl = "https://api.nuget.org/v3-flatcontainer/$packageId/$packageVersion/$packageId.$packageVersion.nupkg"
+            Invoke-WebRequest -Uri $packageUrl -OutFile $nupkg -UseBasicParsing -TimeoutSec 30 -EA Stop
             $ex = Join-Path $env:TEMP "esent_$(Get-Random)"
-            [IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $ex)
-            $found = Get-ChildItem $ex -Recurse -Filter 'Microsoft.Isam.Esent.Interop.dll' -EA SilentlyContinue | Where-Object { $_.FullName -match 'net45' } | Select-Object -First 1
-            if (-not $found) { $found = Get-ChildItem $ex -Recurse -Filter 'Microsoft.Isam.Esent.Interop.dll' -EA SilentlyContinue | Select-Object -First 1 }
-            if (-not $found) { return $null }
-            Copy-Item $found.FullName $dll -Force
-            Remove-Item $ex,$nupkg -Recurse -Force -EA SilentlyContinue
+            try {
+                [IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $ex)
+                $found = Get-ChildItem $ex -Recurse -Filter 'Microsoft.Isam.Esent.Interop.dll' -EA SilentlyContinue | Where-Object { $_.FullName -match 'net45' } | Select-Object -First 1
+                if (-not $found) { $found = Get-ChildItem $ex -Recurse -Filter 'Microsoft.Isam.Esent.Interop.dll' -EA SilentlyContinue | Select-Object -First 1 }
+                if (-not $found) { return $null }
+                Copy-Item $found.FullName $dll -Force
+            } finally {
+                Remove-Item $ex,$nupkg -Recurse -Force -EA SilentlyContinue
+            }
         } catch { return $null }
     }
     try { Add-Type -Path $dll -EA Stop } catch { return $null }
@@ -1633,7 +1667,7 @@ function Live-Proc {
         $ci = try { Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $p.Id) -EA SilentlyContinue } catch { $null }
         Write-Mon "New process: $($p.ProcessName) (PID $($p.Id)) parent=$(try{(Get-Process -Id $ci.ParentProcessId -EA SilentlyContinue).ProcessName}catch{'?'}) path=$path"
         if ($ci -and $ci.CommandLine) { Write-Mon "  cmd: $($ci.CommandLine)" }
-        if ($path) { Invoke-BinaryEvaluation -Name $p.ProcessName -Path $path -Pid $p.Id -Source 'Live process' }
+        if ($path) { Invoke-BinaryEvaluation -Name $p.ProcessName -Path $path -ProcessId $p.Id -Source 'Live process' }
         if ($ci -and ($h2 = Get-KeywordMatch $ci.CommandLine)) { Add-Finding Review 'Live process' "$($p.ProcessName) PID $($p.Id)" $ci.CommandLine "Command line matches '$h2'" '' '' -Score 18 -Confidence Medium }
         if ($p.ProcessName -eq 'RobloxPlayerBeta' -and $deepDone.Add($p.Id)) {
             $MonStats.Deep++; Write-Mon 'Roblox started - deep memory pass.' Cyan; Start-Sleep -Seconds 8
@@ -1685,7 +1719,7 @@ function Live-Auto {
     }
 }
 function Live-Mod {
-    foreach ($rp in @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue)) { try { foreach ($m in $rp.Modules) { if (-not (Test-SeenOnce "lm|$($m.FileName)")) { continue }; $s = Get-SigVerdict $m.FileName; $tr = $false; if ($s.Verdict -eq 'Valid') { foreach ($pu in $TrustedModulePublishers) { if ($s.Publisher -like "*$pu*") { $tr = $true; break } } }; Write-Mon "Roblox module: $($m.ModuleName) [$($m.FileName)] sig=$($s.Verdict)"; if (-not $tr) { Add-Finding Detected 'Live module' $m.ModuleName $m.FileName "Newly loaded into Roblox, signature $($s.Verdict)" '' 'Verify origin' -Score $(if ($m.FileName -match '\\(Temp|Downloads)\\') { 45 } else { 25 }) -Confidence Medium } } } catch {} }
+    foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) { try { foreach ($m in $rp.Modules) { if (-not (Test-SeenOnce "lm|$($m.FileName)")) { continue }; $s = Get-SigVerdict $m.FileName; $tr = $false; if ($s.Verdict -eq 'Valid') { foreach ($pu in $TrustedModulePublishers) { if ($s.Publisher -like "*$pu*") { $tr = $true; break } } }; Write-Mon "Roblox module: $($m.ModuleName) [$($m.FileName)] sig=$($s.Verdict)"; if (-not $tr) { Add-Finding Detected 'Live module' $m.ModuleName $m.FileName "Newly loaded into Roblox, signature $($s.Verdict)" '' 'Verify origin' -Score $(if ($m.FileName -match '\\(Temp|Downloads)\\') { 45 } else { 25 }) -Confidence Medium } } } catch {} }
 }
 
 if (-not $NoLive) {
@@ -1708,7 +1742,7 @@ if (-not $NoLive) {
         if (((Get-Date)-$t5).TotalSeconds -ge 15) { try { Live-Auto } catch {}; $t5=Get-Date }
         if (((Get-Date)-$t6).TotalSeconds -ge 5)  { try { Live-Mod } catch {}; $t6=Get-Date }
         try { Send-Partial 'watch' } catch {}
-        if (((Get-Date)-$lastStat).TotalSeconds -ge 10) { $rp = @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue); Write-Host ("[WATCH] {0}p {1}f {2}d {3}n | Roblox: {4}" -f $MonStats.Proc,$MonStats.File,$MonStats.Drv,($MonStats.List+$MonStats.Conn),$(if($rp.Count){'running'}else{'idle'})) -ForegroundColor DarkCyan; $lastStat=Get-Date }
+        if (((Get-Date)-$lastStat).TotalSeconds -ge 10) { $rp = @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' }); Write-Host ("[WATCH] {0}p {1}f {2}d {3}n | Roblox: {4}" -f $MonStats.Proc,$MonStats.File,$MonStats.Drv,($MonStats.List+$MonStats.Conn),$(if($rp.Count){'running'}else{'idle'})) -ForegroundColor DarkCyan; $lastStat=Get-Date }
         Start-Sleep -Seconds $Config.LivePollSeconds
     }
     Write-Mon 'Live watch stopped.' Cyan
