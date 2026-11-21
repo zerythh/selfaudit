@@ -1,6 +1,7 @@
 <#
   SelfAudit - static + live cheat / rootkit / forensics scanner.
   Webhook is pulled from a separate text file so it can be rotated without touching code.
+  Partial results are uploaded every ~45s during a run so a killed session still leaves evidence.
 #>
 [CmdletBinding()]
 param(
@@ -28,7 +29,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyCon
 
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $ScanStart = Get-Date
-$RepoBase = 'https://raw.githubusercontent.com/zerythh/selfaudit/main'
+$RepoBase = 'https://raw.githubusercontent.com/zeryth/selfaudit/main'
 $DefaultWebhookUrl = "$RepoBase/WebhookUrl.txt"
 $DataRoot = Join-Path $env:LOCALAPPDATA 'SelfAudit'
 $ToolRoot = Join-Path $DataRoot 'Tools'
@@ -189,7 +190,7 @@ function Write-AuditError {
 }
 trap { Write-AuditError -Record $_ -Stage 'Terminating error'; continue }
 
-function Set-Phase { param([string]$Name, [ValidateSet('Completed','Partial','Failed','Skipped')][string]$State, [string]$Note = '') $ScanHealth[$Name] = [pscustomobject]@{ State=$State; Note=$Note } }
+function Set-Phase { param([string]$Name, [ValidateSet('Completed','Partial','Failed','Skipped')][string]$State, [string]$Note = '') $ScanHealth[$Name] = [pscustomobject]@{ State=$State; Note=$Note }; try { Send-Partial $Name } catch {} }
 function Set-AuditProgress { param([int]$P,[string]$A,[string]$S) Write-Progress -Activity $A -Status $S -PercentComplete $P; Write-Host ("`n[{0,3}%] {1} - {2}" -f $P,$A,$S) -ForegroundColor Cyan }
 function Get-Band([int]$S) { if ($S -ge 60) { 'CRITICAL' } elseif ($S -ge 30) { 'HIGH' } elseif ($S -ge 12) { 'MEDIUM' } elseif ($S -ge 4) { 'LOW' } else { 'INFO' } }
 function Test-SeenOnce([string]$K) { return $SeenKeys.Add($K) }
@@ -227,6 +228,67 @@ function Test-IsPrivateIp([string]$Ip) {
 function Get-KeywordMatch([string]$T) { if (-not $T) { return $null }; $m = [regex]::Match($T, $KeywordRegex, 'IgnoreCase'); if ($m.Success) { return $m.Value.ToLower() }; return $null }
 function Test-StrongKeyword([string]$T) { if (-not $T) { return $null }; $l = $T.ToLower(); foreach ($k in $StrongKeywords) { if ($l -match [regex]::Escape($k)) { return $k } }; return $null }
 function Test-GamingAllowlist([string]$T) { if (-not $T) { return $false }; $l = $T.ToLower(); foreach ($k in $GamingAllowlist) { if ($l -match [regex]::Escape($k)) { return $true } }; return $false }
+
+# ---------------------------------------------------------------------------
+# Archive + delivery (defined early so Set-Phase can checkpoint)
+# ---------------------------------------------------------------------------
+function New-Zip {
+    param([string]$Dest,[switch]$TextOnly)
+    if (Test-Path $Dest) { Remove-Item $Dest -Force -ErrorAction SilentlyContinue }
+    $te = @('.txt','.log','.json','.html','.csv')
+    $files = Get-ChildItem $OutDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $TextOnly -or $te -contains $_.Extension.ToLower() }
+    $fs = [IO.File]::Create($Dest)
+    try {
+        $a = [IO.Compression.ZipArchive]::new($fs,[IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($f in $files) {
+                try {
+                    $e = $a.CreateEntry($f.FullName.Substring($OutDir.Length).TrimStart('\'),[IO.Compression.CompressionLevel]::Optimal)
+                    $es = $e.Open()
+                    try { $ins = [IO.File]::OpenRead($f.FullName); try { $ins.CopyTo($es) } finally { $ins.Dispose() } } finally { $es.Dispose() }
+                } catch {}
+            }
+        } finally { $a.Dispose() }
+    } finally { $fs.Dispose() }
+}
+
+function Send-Webhook {
+    param([string]$Path,[string]$Summary)
+    if ($NoUpload) { return $false }
+    if (-not $script:WebhookValid) { Write-Host '  [WARN] No valid webhook.' -ForegroundColor Yellow; return $false }
+    $payload = @{ username='SelfAudit'; content=$Summary; allowed_mentions=@{ parse=@() } } | ConvertTo-Json -Depth 4
+    for ($n = 1; $n -le 3; $n++) {
+        $cl = $null; $fm = $null
+        try {
+            $cl = [Net.Http.HttpClient]::new(); $cl.Timeout = [TimeSpan]::FromSeconds(180)
+            $fm = [Net.Http.MultipartFormDataContent]::new()
+            $fm.Add([Net.Http.StringContent]::new($payload,[Text.Encoding]::UTF8,'application/json'),'payload_json')
+            $bc = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($Path))
+            $bc.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/zip')
+            $fm.Add($bc,'files[0]',[IO.Path]::GetFileName($Path))
+            $r = $cl.PostAsync($Webhook,$fm).GetAwaiter().GetResult(); $c = [int]$r.StatusCode
+            if ($c -ge 200 -and $c -lt 300) { Write-Host '  [OK] Uploaded.' -ForegroundColor Green; return $true }
+            if ($c -eq 429) { $w=5; try { $w=[int]$r.Headers.GetValues('Retry-After')|Select-Object -First 1 } catch {}; Start-Sleep ([Math]::Min(30,[Math]::Max(2,$w))); continue }
+            Write-Host "  [WARN] HTTP $c" -ForegroundColor Yellow; return $false
+        } catch { Write-Host "  [WARN] Attempt $n`: $($_.Exception.Message)" -ForegroundColor Yellow; Start-Sleep 3 }
+        finally { if ($fm) { $fm.Dispose() }; if ($cl) { $cl.Dispose() } }
+    }
+    return $false
+}
+
+$script:LastPartial = Get-Date
+function Send-Partial {
+    param([string]$Tag)
+    if ($NoUpload -or -not $script:WebhookValid) { return }
+    if (((Get-Date) - $script:LastPartial).TotalSeconds -lt 45) { return }
+    $script:LastPartial = Get-Date
+    try {
+        $p = Join-Path $env:TEMP ("partial_$(Get-Random).zip")
+        New-Zip -Dest $p -TextOnly
+        Send-Webhook -Path $p -Summary "**PARTIAL - $Tag** | ``$env:COMPUTERNAME`` / ``$env:USERNAME`` | still running" | Out-Null
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 # ============================================================================
 # Webhook resolution
@@ -354,7 +416,6 @@ namespace SA {
       finally { CloseHandle(h); }
     }
 
-    // Process list straight from the kernel - compared against user-mode enumerations to find hidden PIDs
     public static List<ProcRec> ProcessList() {
       var l = new List<ProcRec>();
       uint sz = 1 << 20, ret;
@@ -563,7 +624,6 @@ namespace SA {
     }
   }
 
-  // Byte-pattern rule engine over private committed regions
   public static class Y {
     static int Find(byte[] b, byte[] p) {
       if (p.Length == 0 || p.Length > b.Length) return -1;
@@ -832,7 +892,6 @@ function Get-Tool {
     return $null
 }
 
-# Central binary evaluator: hash -> strings -> YARA-lite -> keyword -> signature -> reputation
 function Invoke-BinaryEvaluation {
     param([string]$Name,[string]$Path,[string]$Pid = '',[string]$Source = 'Process')
     if (-not $Path) { return }
@@ -1107,7 +1166,6 @@ function Test-PESieve { param([int]$P,[string]$T='')
     } catch {} finally { Remove-Item -LiteralPath $j -Force -EA SilentlyContinue }
 }
 
-# Rule scan over private executable regions of every non-system process
 $rNames = @($Rules | ForEach-Object { $_.N })
 $rWeights = @($Rules | ForEach-Object { $_.W })
 $rMins = @($Rules | ForEach-Object { $_.M })
@@ -1449,14 +1507,10 @@ function Get-SrumUsage {
     $copy = Join-Path $work 'SRUDB.dat'
     try {
         $src = [IO.File]::Open($sru,'Open','Read','ReadWrite'); try { $dst=[IO.File]::Create($copy); try { $src.CopyTo($dst) } finally { $dst.Dispose() } } finally { $src.Dispose() }
-        $E = [Microsoft.Isam.Esent.Interop]
         $inst = [Microsoft.Isam.Esent.Interop.JET_INSTANCE]::new()
         $ses = [Microsoft.Isam.Esent.Interop.JET_SESID]::new()
         $dbid = [Microsoft.Isam.Esent.Interop.JET_DBID]::new()
-        $nullInst = [Microsoft.Isam.Esent.Interop.JET_INSTANCE]::Nil
         $nullSes = [Microsoft.Isam.Esent.Interop.JET_SESID]::Nil
-        $nullDb = [Microsoft.Isam.Esent.Interop.JET_DBID]::Nil
-        $nullTbl = [Microsoft.Isam.Esent.Interop.JET_TABLEID]::Nil
         [Microsoft.Isam.Esent.Interop.Api]::JetCreateInstance([ref]$inst, 'SRU')
         [Microsoft.Isam.Esent.Interop.Api]::JetSetSystemParameter([ref]$inst, $nullSes, [Microsoft.Isam.Esent.Interop.JET_param]::TempPath, 0, $work)
         [Microsoft.Isam.Esent.Interop.Api]::JetSetSystemParameter([ref]$inst, $nullSes, [Microsoft.Isam.Esent.Interop.JET_param]::LogFileSize, 1, $null)
@@ -1652,6 +1706,7 @@ if (-not $NoLive) {
         if (((Get-Date)-$t4).TotalSeconds -ge 10) { try { Live-Net } catch {}; $t4=Get-Date }
         if (((Get-Date)-$t5).TotalSeconds -ge 15) { try { Live-Auto } catch {}; $t5=Get-Date }
         if (((Get-Date)-$t6).TotalSeconds -ge 5)  { try { Live-Mod } catch {}; $t6=Get-Date }
+        try { Send-Partial 'watch' } catch {}
         if (((Get-Date)-$lastStat).TotalSeconds -ge 10) { $rp = @(Get-Process -Name RobloxPlayerBeta -EA SilentlyContinue); Write-Host ("[WATCH] {0}p {1}f {2}d {3}n | Roblox: {4}" -f $MonStats.Proc,$MonStats.File,$MonStats.Drv,($MonStats.List+$MonStats.Conn),$(if($rp.Count){'running'}else{'idle'})) -ForegroundColor DarkCyan; $lastStat=Get-Date }
         Start-Sleep -Seconds $Config.LivePollSeconds
     }
@@ -1732,45 +1787,8 @@ Write-Progress -Activity 'Self-audit' -Completed
 try { Stop-Transcript | Out-Null } catch {}
 
 # ============================================================================
-# 16. Zip + upload
+# 16. Final archive + upload
 # ============================================================================
-function New-Zip {
-    param([string]$Dest,[switch]$TextOnly)
-    if (Test-Path $Dest) { Remove-Item $Dest -Force }
-    $te = @('.txt','.log','.json','.html','.csv')
-    $files = Get-ChildItem $OutDir -File -Recurse -EA SilentlyContinue | Where-Object { -not $TextOnly -or $te -contains $_.Extension.ToLower() }
-    $fs = [IO.File]::Create($Dest)
-    try {
-        $a = [IO.Compression.ZipArchive]::new($fs,[IO.Compression.ZipArchiveMode]::Create)
-        try { foreach ($f in $files) { $e = $a.CreateEntry($f.FullName.Substring($OutDir.Length).TrimStart('\'),[IO.Compression.CompressionLevel]::Optimal); $es = $e.Open(); try { $ins=[IO.File]::OpenRead($f.FullName); try { $ins.CopyTo($es) } finally { $ins.Dispose() } } finally { $es.Dispose() } } }
-        finally { $a.Dispose() }
-    } finally { $fs.Dispose() }
-}
-
-function Send-Webhook {
-    param([string]$Path,[string]$Summary)
-    if ($NoUpload) { return $false }
-    if (-not $script:WebhookValid) { Write-Host '  [WARN] No valid webhook.' -ForegroundColor Yellow; return $false }
-    $payload = @{ username='SelfAudit'; content=$Summary; allowed_mentions=@{ parse=@() } } | ConvertTo-Json -Depth 4
-    for ($n = 1; $n -le 3; $n++) {
-        $cl = $null; $fm = $null
-        try {
-            $cl = [Net.Http.HttpClient]::new(); $cl.Timeout = [TimeSpan]::FromSeconds(180)
-            $fm = [Net.Http.MultipartFormDataContent]::new()
-            $fm.Add([Net.Http.StringContent]::new($payload,[Text.Encoding]::UTF8,'application/json'),'payload_json')
-            $bc = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($Path))
-            $bc.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/zip')
-            $fm.Add($bc,'files[0]',[IO.Path]::GetFileName($Path))
-            $r = $cl.PostAsync($Webhook,$fm).GetAwaiter().GetResult(); $c = [int]$r.StatusCode
-            if ($c -ge 200 -and $c -lt 300) { Write-Host '  [OK] Uploaded.' -ForegroundColor Green; return $true }
-            if ($c -eq 429) { $w=5; try { $w=[int]$r.Headers.GetValues('Retry-After')|Select-Object -First 1 } catch {}; Start-Sleep ([Math]::Min(30,[Math]::Max(2,$w))); continue }
-            Write-Host "  [WARN] HTTP $c" -ForegroundColor Yellow; return $false
-        } catch { Write-Host "  [WARN] Attempt $n`: $($_.Exception.Message)" -ForegroundColor Yellow; Start-Sleep 3 }
-        finally { if ($fm) { $fm.Dispose() }; if ($cl) { $cl.Dispose() } }
-    }
-    return $false
-}
-
 $sum = @(
     "**SelfAudit $verdict** - effective $($script:EffScore) (raw $($script:TotalScore))"
     "Host: ``$env:COMPUTERNAME`` | User: ``$env:USERNAME`` | Window: ${Days}d | Duration: ${duration}s"
