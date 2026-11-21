@@ -130,7 +130,7 @@ $CheatDomains = @(
     'fluxus.team','codex.lol','deltaexploits.com','arceusx.net','awp.gg','getsolara.gg','seliware.com',
     'potassium.pro','velocitylite.com','volt.bz','zorara.com','madium.xyz','synapse-x.xyz','sirhurt.net',
     'evon.cc','trigon.wtf','matcha.gg','macsploit.com','roexec.com','krampus.shop','exloader.net',
-    'jjsploit.net','rbxscripts.com','bloxscripts.com','rbx.gg'
+    'jjsploit.net','rbxscripts.com','bloxscripts.com','rbx.gg','xeno.now'
 )
 $CheatNameFragments = $CheatKeywords
 $StrongKeywords = @(
