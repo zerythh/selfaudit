@@ -15,12 +15,29 @@ param(
     [switch]$SelfExclude,
     [switch]$NoUpload,
     [switch]$NoPause,
+    [switch]$HideDetails,
     [string]$Webhook = '',
     [string]$WebhookFile = '',
     [string]$Baseline = '',
     [switch]$SaveBaseline,
     [string]$VTApiKey = ''
 )
+
+$script:HideDetailsEnabled = [bool]$HideDetails
+
+function Write-Host {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position=0, ValueFromRemainingArguments=$true)]
+        [object[]]$Object,
+        [ConsoleColor]$ForegroundColor,
+        [ConsoleColor]$BackgroundColor,
+        [switch]$NoNewline,
+        [string]$Separator = ' '
+    )
+    if ($script:HideDetailsEnabled) { return }
+    Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+}
 
 $ErrorActionPreference = 'Continue'
 $PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true
@@ -193,7 +210,7 @@ function Write-AuditError {
 trap { Write-AuditError -Record $_ -Stage 'Terminating error'; continue }
 
 function Set-Phase { param([string]$Name, [ValidateSet('Completed','Partial','Failed','Skipped')][string]$State, [string]$Note = '') $ScanHealth[$Name] = [pscustomobject]@{ State=$State; Note=$Note }; try { Send-Partial $Name } catch {} }
-function Set-AuditProgress { param([int]$P,[string]$A,[string]$S) Write-Progress -Activity $A -Status $S -PercentComplete $P; Write-Host ("`n[{0,3}%] {1} - {2}" -f $P,$A,$S) -ForegroundColor Cyan }
+function Set-AuditProgress { param([int]$P,[string]$A,[string]$S) if ($script:HideDetailsEnabled) { Write-Progress -Activity 'SelfAudit' -Status 'System check in progress...' -PercentComplete $P; Microsoft.PowerShell.Utility\Write-Host ("`n[{0,3}%] System check in progress..." -f $P) -ForegroundColor Cyan } else { Write-Progress -Activity $A -Status $S -PercentComplete $P; Write-Host ("`n[{0,3}%] {1} - {2}" -f $P,$A,$S) -ForegroundColor Cyan } }
 function Get-Band([int]$S) { if ($S -ge 60) { 'CRITICAL' } elseif ($S -ge 30) { 'HIGH' } elseif ($S -ge 12) { 'MEDIUM' } elseif ($S -ge 4) { 'LOW' } else { 'INFO' } }
 function Test-SeenOnce([string]$K) { return $SeenKeys.Add($K) }
 
@@ -343,6 +360,7 @@ try { Set-Content -LiteralPath $ErrorLogPath -Value "SelfAudit error log - $Stam
 $LogPath = Join-Path $OutDir 'audit.log'
 try { Start-Transcript -Path $LogPath -Append -Force -ErrorAction Stop | Out-Null } catch {}
 Write-Host "[INFO] Output: $OutDir" -ForegroundColor Cyan
+if ($HideDetails) { Microsoft.PowerShell.Utility\Write-Host 'HideDetails enabled: technical console details are hidden; scan findings remain recorded in the report.' -ForegroundColor Yellow }
 
 Resolve-Webhook
 if ($SelfExclude) { try { Add-MpPreference -ExclusionPath $BaseDir -EA Stop; Write-Host "[INFO] Self-exclusion added." -ForegroundColor Cyan } catch {} }
@@ -1815,9 +1833,17 @@ if ($SaveBaseline) {
 }
 foreach ($e in @($Error)) { Write-AuditError -Record $e -Stage 'Collected error' }
 
-Write-Host "`n================================================================" -ForegroundColor DarkMagenta
-Write-Host " VERDICT: $verdict (raw $($script:TotalScore) / effective $($script:EffScore), $($det.Count) detected, $($newHits.Count) new)" -ForegroundColor $vColor
-Write-Host "================================================================" -ForegroundColor DarkMagenta
+if ($HideDetails) {
+    if (($det.Count + $rev.Count) -gt 0) {
+        Microsoft.PowerShell.Utility\Write-Host "`nScan complete. Potential findings were recorded. Review the report for details." -ForegroundColor Yellow
+    } else {
+        Microsoft.PowerShell.Utility\Write-Host "`nScan complete. No findings were recorded." -ForegroundColor Green
+    }
+} else {
+    Write-Host "`n================================================================" -ForegroundColor DarkMagenta
+    Write-Host " VERDICT: $verdict (raw $($script:TotalScore) / effective $($script:EffScore), $($det.Count) detected, $($newHits.Count) new)" -ForegroundColor $vColor
+    Write-Host "================================================================" -ForegroundColor DarkMagenta
+}
 Write-Progress -Activity 'Self-audit' -Completed
 try { Stop-Transcript | Out-Null } catch {}
 
