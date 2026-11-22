@@ -1068,7 +1068,7 @@ try {
 try { $idLines | Set-Content -LiteralPath (Join-Path $OutDir 'identity.txt') -Encoding UTF8 -EA Stop; Set-Phase 'Identity' 'Completed' } catch { Set-Phase 'Identity' 'Failed' }
 
 # ============================================================================
-# 3. Rootkit checks: hidden processes and hidden drivers
+# 3. Rootkit checks: hidden processes and unbacked kernel modules
 # ============================================================================
 Set-AuditProgress 11 'Self-audit' 'Running rootkit cross-view checks...'
 Write-Host "`n=== Rootkit cross-view ===" -ForegroundColor Magenta
@@ -1080,12 +1080,76 @@ foreach ($h in $hidden) { Add-Finding Detected 'Rootkit' "$($h.Name) (PID $($h.P
 if ($hidden.Count -eq 0) { Write-Host '  No hidden processes' -ForegroundColor Green }
 Set-Phase 'Hidden process check' 'Completed'
 
+# FIX: driver check rebuilt.
+#  - EnumDeviceDrivers returns every module in PsLoadedModuleList, including kernel DLLs,
+#    the crash-dump stack and sub-drivers loaded by a parent. None of those get a service.
+#  - Win32_SystemDriver omits services whose ImagePath is empty, so it is a lossy oracle.
+#    The registry is walked for Type=1 services and keyed on the service NAME as well as
+#    the ImagePath basename, which is what actually corresponds to a registered driver.
+#  - Inbox modules are excluded by exact filename, then anything left inside C:\Windows is
+#    only reported when it is missing from disk or not Microsoft-signed.
+#  - Findings are deduped per filename and scored lower inside the Windows directory.
 try {
     $kmods = @([SA.N]::KernelModulePaths() | ForEach-Object { ($_ -replace '^\\\?\?\\','') -replace '^\\SystemRoot\\',$WinRoot })
-    $knownDrvFiles = @(Get-CimInstance Win32_SystemDriver -EA SilentlyContinue | Where-Object { $_.PathName } | ForEach-Object { [IO.Path]::GetFileName($_.PathName).ToLower() })
-    $hiddenDrv = @($kmods | Where-Object { $b2 = [IO.Path]::GetFileName($_).ToLower(); $b2 -and ($knownDrvFiles -notcontains $b2) -and ($_ -notmatch '\\(ntoskrnl|hal|ci|clfs|win32k|fltmgr|ndis|tcpip)') })
-    foreach ($d in $hiddenDrv) { Add-Finding Detected 'Rootkit' 'Hidden kernel module' $d 'Loaded driver with no matching service entry' '' 'Possible DKOM-hidden driver' -Score 55 -Confidence Medium }
-    if ($hiddenDrv.Count -eq 0) { Write-Host '  No hidden kernel modules' -ForegroundColor Green }
+    $kmods = @($kmods | ForEach-Object { if ($_ -notmatch '^[A-Za-z]:\\') { Join-Path $WinRoot ($_ -replace '^\\','') } else { $_ } })
+
+    $knownDrvFiles = [System.Collections.Generic.HashSet[string]]::new()
+    $svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    foreach ($s in (Get-ChildItem $svcRoot -EA SilentlyContinue)) {
+        $type = try { (Get-ItemProperty -LiteralPath $s.PSPath -Name Type -EA Stop).Type } catch { $null }
+        if ($type -ne 1) { continue }
+        [void]$knownDrvFiles.Add($s.PSChildName.ToLower())
+        $ip = try { (Get-ItemProperty -LiteralPath $s.PSPath -Name ImagePath -EA Stop).ImagePath } catch { $null }
+        if ($ip) {
+            $leaf = [IO.Path]::GetFileName(($ip.Trim('"') -replace '^\\\?\?\\','' -replace '^\\SystemRoot\\',$WinRoot)).ToLower()
+            if ($leaf) { [void]$knownDrvFiles.Add($leaf) }
+        }
+    }
+    foreach ($d in (Get-CimInstance Win32_SystemDriver -EA SilentlyContinue)) {
+        if ($d.Name) { [void]$knownDrvFiles.Add($d.Name.ToLower()) }
+        if ($d.PathName) { $leaf = [IO.Path]::GetFileName($d.PathName).ToLower(); if ($leaf) { [void]$knownDrvFiles.Add($leaf) } }
+    }
+
+    # Inbox kernel modules that never register a service. Exact filenames only, so that
+    # short prefixes do not swallow interesting names (kd vs kdmapper.sys).
+    $drvExclude = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+        'ntoskrnl.exe','hal.dll','ci.dll','clfs.sys','win32k.sys','win32kbase.sys','win32kfull.sys','fltmgr.sys',
+        'ndis.sys','tcpip.sys','crashdmp.sys','bootvid.dll','pshed.dll','kd.dll','symcryptk.dll','globmerger.sys',
+        'winaccel.sys','wpprecorder.sys','wmilib.sys','watchdog.sys','kmpdc.sys','kerb3961kernel.sys','portcls.sys',
+        'ks.sys','drmk.sys','dxgmms1.sys','dxgmms2.sys','netio.sys','fwpkclnt.sys','classpnp.sys','wdfldr.sys',
+        'hidclass.sys','hidparse.sys','usbd.sys','battc.sys','btampm.sys','cmimcext.sys','tm.sys','tbs.sys',
+        'clipsp.sys','werkernel.sys','fs_rec.sys','ntosext.sys','cea.sys','storport.sys','winhvr.sys','volsnap.sys',
+        'mountmgr.sys','partmgr.sys','ksecdd.sys','msrpc.sys','cng.sys','ksecpkg.sys','tcpipreg.sys','pdc.sys',
+        'dam.sys','ntfs.sys','fvevol.sys','iorate.sys','wof.sys','bindflt.sys','fileinfo.sys','wdf01000.sys'
+    ))
+
+    $seenDrv = @{}
+    $flagged = 0
+    foreach ($mod in $kmods) {
+        $leaf = [IO.Path]::GetFileName($mod).ToLower()
+        if (-not $leaf) { continue }
+        if ($drvExclude.Contains($leaf)) { continue }
+        if ($leaf.StartsWith('dump_')) { continue }
+        if ($knownDrvFiles.Contains($leaf)) { continue }
+        if ($seenDrv.ContainsKey($leaf)) { continue }
+        $seenDrv[$leaf] = 1
+
+        $onDisk = Test-Path -LiteralPath $mod
+        $msSigned = $false
+        if ($onDisk) {
+            $sv = Get-SigVerdict $mod
+            $msSigned = ($sv.Verdict -eq 'Valid' -and $sv.Publisher -match 'Microsoft')
+        }
+        $inWin = $mod.StartsWith($WinRoot,'OrdinalIgnoreCase')
+        if ($inWin -and $msSigned) { continue }
+
+        $why = if (-not $onDisk) { 'Loaded module with no service entry and no file on disk' }
+               elseif (-not $msSigned) { 'Loaded module with no service entry, not Microsoft-signed' }
+               else { 'Loaded module outside the Windows directory with no service entry' }
+        Add-Finding Detected 'Rootkit' 'Unbacked kernel module' $mod $why '' 'Identify the owner' -Score $(if ($inWin) { 35 } else { 55 }) -Confidence High
+        $flagged++
+    }
+    if ($flagged -eq 0) { Write-Host '  No unbacked kernel modules' -ForegroundColor Green }
     Set-Phase 'Hidden driver check' 'Completed'
 } catch { Set-Phase 'Hidden driver check' 'Failed' }
 
@@ -1853,9 +1917,13 @@ $Meta['live'] = @{ durationSeconds = [int]((Get-Date)-$LiveStart).TotalSeconds; 
 # 14. Correlation
 # ============================================================================
 Set-AuditProgress 90 'Self-audit' 'Correlating...'
-foreach ($g in @($Findings | Where-Object { $_.Severity -ne 'Info' } | Group-Object Name | Where-Object { $_.Count -gt 1 })) {
+# FIX: rootkit findings are 40-odd distinct subjects sharing one name, so they group by
+# path. Every other category keeps name-based grouping, which is what makes a repeated
+# filename across BAM + Download + MUICache correlate into one finding.
+foreach ($g in @($Findings | Where-Object { $_.Severity -ne 'Info' } | Group-Object { if ($_.Category -eq 'Rootkit') { "rootkit|$($_.Path)" } else { $_.Name } } | Where-Object { $_.Count -gt 1 })) {
     $bonus = [Math]::Min(45, ($g.Count - 1) * 12)
-    Add-Finding Detected 'Correlation' $g.Name $g.Group[0].Path "$($g.Count) independent indicators on one subject" '' 'Multiple weak signals beat one strong signal' -Score $bonus -Confidence High -Evidence @($g.Group | ForEach-Object { "$($_.Category): $($_.Reason)" })
+    $subject = if ($g.Group[0].Category -eq 'Rootkit') { $g.Group[0].Path } else { $g.Group[0].Name }
+    Add-Finding Detected 'Correlation' $subject $g.Group[0].Path "$($g.Count) independent indicators on one subject" '' 'Multiple weak signals beat one strong signal' -Score $bonus -Confidence High -Evidence @($g.Group | ForEach-Object { "$($_.Category): $($_.Reason)" })
     $Stats.Correlated++
 }
 
@@ -1867,7 +1935,7 @@ $det = @($Findings | Where-Object Severity -eq 'Detected'); $rev = @($Findings |
 $crit = @($Findings | Where-Object Band -eq 'CRITICAL'); $newHits = @($Findings | Where-Object { $_.New -and $_.Severity -ne 'Info' })
 $verdict = if ($crit.Count -gt 0 -or $script:EffScore -ge 110) { 'FAIL' } elseif ($script:EffScore -ge 40) { 'PASS WITH NOTES' } else { 'CLEAN' }
 $vColor = switch ($verdict) { 'FAIL' { 'Red' } 'PASS WITH NOTES' { 'Yellow' } default { 'Green' } }
-$duration = [int]((Get-Date) - $ScanStart).TotalSeconds
+$duration = [int]((Get-Date) - $ScanStart)
 $enc = { param($s) [Security.SecurityElement]::Escape([string]$s) }
 $rows = foreach ($f in ($Findings | Sort-Object @{E={-$_.Score}},Category,Name)) {
     $ev = if ($f.Evidence.Count) { '<br>' + (($f.Evidence | ForEach-Object { '&bull; ' + (& $enc $_) }) -join '<br>') } else { '' }
