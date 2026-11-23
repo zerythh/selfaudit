@@ -123,7 +123,7 @@ $CheatKeywords = @(
     'auto farm','autofarm','autoclicker','auto clicker','macro recorder','pixel bot','colorbot','color bot',
     'radar hack','streamproof','hwid spoofer','hwid spoof','hwid reset','dma cheat','kmbox','kmbox net','makcu',
     'fuser','teensy','arduino hid','xim apex','rewasd','cronus zen','titan two','strike pack','glitcher',
-    'kdmapper','process hacker','cheat engine','xmrig','stratum+tcp'
+    'kdmapper','process hacker','cheat engine','xmrig','stratum+tcp', 'newui'
 )
 $CheatDomains = @(
     'wearedevs.net','scriptblox.com','rscripts.net','weao.xyz','voxlis.net','robloxscripts.com','krnl.cat',
