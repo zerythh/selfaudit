@@ -4,6 +4,7 @@
   Reports are built and zipped in a unique temp directory and uploaded to Discord - nothing is
   written to the Desktop. Partial results are uploaded every ~45s during a run so a killed
   session still leaves evidence.
+
 #>
 [CmdletBinding()]
 param(
@@ -72,7 +73,7 @@ if ($null -eq $script:Webhook) { $script:Webhook = '' }
 $WinRoot = $env:SystemRoot.TrimEnd('\') + '\'
 $Findings = [System.Collections.Generic.List[object]]::new()
 $Meta = [ordered]@{}
-$Stats = [ordered]@{ Processes=0; Modules=0; Files=0; BrowserUrls=0; Downloads=0; Prefetch=0; Amcache=0; Correlated=0; Drivers=0; Pipes=0; Listeners=0; Bam=0; UserAssist=0; MuiCache=0; RegionsScanned=0; RepLookups=0 }
+$Stats = [ordered]@{ Processes=0; Modules=0; Files=0; BrowserUrls=0; Downloads=0; Prefetch=0; Amcache=0; Correlated=0; Drivers=0; Pipes=0; Listeners=0; Bam=0; UserAssist=0; MuiCache=0; RegionsScanned=0; RepLookups=0; Watchdog=0; Handles=0; Injected=0; Persist=0; DeepArtifacts=0 }
 $ScanHealth = [ordered]@{}
 $script:TotalScore = 0
 $script:EffScore = 0
@@ -141,6 +142,18 @@ $StrongKeywords = @(
     'hwid spoofer','kdmapper'
 )
 
+# Bare stem names for filename normalisation: "Solara Bootstrapper (2).exe" and "xeno-1.0.3.exe"
+# reduce to a stem that is compared exactly, so version and suffix noise cannot hide a match.
+$CheatStems = @(
+    'solara','solarav3','getsolara','xeno','synapse','synapsex','synapsez','sirhurt','protosmasher','scriptware',
+    'krnl','fluxus','arceusx','celery','evon','trigon','seliware','oxygenu','krampus','macsploit','zorara',
+    'velocitylite','madium','aimmy','matcha','serotonin','melatonin','dx9ware','ronix','potassium','valex',
+    'exloader','roexec','rbxai','colorbot','aimbot','triggerbot','newuiv3','awpgg','vegax','matrixhub','nihon',
+    'jjsploit','warp','electron','synx'
+)
+$StemSuffixes = @('bootstrapper','bootstrap','launcher','injector','executor','exec','loader','setup','installer','ui','client','svc','service')
+$StemOnlyNames = @('wave','swift','volt','comet','codex','delta','hydrogen','severe','cryptic','nezur')
+
 $StringSignatures = @{
     'WARP'=@('WARP-Service','[MEMORY] Attached to Roblox process PID:','Humanoid::Walkspeed','HWID Mismatch! Reset HWID via Discord bot.','AUTHENTICATE LICENSE KEY','Locked Hardware ID (HWID):')
     'SolaraV3'=@('getsolara.gg','SolaraV3.dll','SOLARA_BOOTSTRAPPER','solara:banned')
@@ -159,6 +172,11 @@ $TrustedModulePublishers = @('Roblox','Microsoft','NVIDIA','Advanced Micro Devic
 $HandleOwnerAllowlist = @('RobloxPlayerBeta','System','Registry','csrss','wininit','services','dwm','explorer','svchost','audiodg','conhost','powershell','pwsh','handle64','handle','procexp64','procexp','procexp64a','SearchHost','ShellExperienceHost','ApplicationFrameHost','sihost','RuntimeBroker','smss','lsass','WmiPrvSE','MsMpEng','SecurityHealthService','Discord','GameOverlayUI','obs64','obs32','RTSS','MSIAfterburner','NVIDIA Share','nvcontainer','SteamOverlayRenderer','XboxGameBarWidgets','RobloxCrashHandler','RobloxStudioBeta','Bloxstrap','Fishstrap','obs-studio','Nahimic','iCUE','LGHUB','RazerCentralService','SteelSeriesGG')
 $PyInstallerCheatMarkers = @('mss','cv2','win32api.pyd','win32gui.pyd','keyboard','pynput','pyautogui')
 $GamingAllowlist = @('armourycrate','asus','icue','corsair','lghub','logitech','razer','steelseries','signalrgb','rtss','msiafterburner','obs','nahimic','nvcontainer','nvidia','wallpaperengine','translucenttb','sharex','discord','spotify','steam','epicgames','riotclient','battle.net','curseforge','mechvibes','customcursor','bakkesmod','onedrive')
+
+# Live-path allowlists: names that legitimately spawn or poll, so the watchdog does not
+# report every shell helper a launcher uses.
+$LiveProcIgnore = @('conhost','openconsole','cmd','powershell','pwsh','wscript','cscript','mshta','rundll32','dllhost','sihost','runtimebroker','taskhostw','backgroundtaskhost','searchprotocolhost','searchfilterhost','compattelrunner','wmiprvse','werfault','dwm','fontdrvhost','audiodg','svchost','csrss','lsass','smss','wininit','services','explorer','shellexperiencehost','startmenuexperiencehost','searchhost','applicationframehost','textinputhost','ctfmon','msedgewebview2','crashpad_handler','nvcontainer','nvsphelper64','amdow','amdfendrsr','gameoverlayui','robloxcrashhandler','bloxstrap','fishstrap','voidstrap')
+$ProcessListTools = @('tasklist.exe','wmic.exe','qprocess.exe','query.exe','pslist.exe','pslist64.exe','handle.exe','handle64.exe')
 
 # YARA-style rule table: name, weight, minimum distinct patterns, patterns (ASCII or hex bytes)
 $Rules = @(
@@ -195,6 +213,8 @@ $SeenPipes = [System.Collections.Generic.HashSet[string]]::new()
 $DnsCache = @{}
 $BaselineKeys = @{}
 $script:HasBaseline = $false
+$script:IM = $null
+$script:InputLevel = $null
 
 # ============================================================================
 # Helpers
@@ -257,6 +277,33 @@ function Test-IsPrivateIp([string]$Ip) {
 function Get-KeywordMatch([string]$T) { if (-not $T) { return $null }; $m = [regex]::Match($T, $KeywordRegex, 'IgnoreCase'); if ($m.Success) { return $m.Value.ToLower() }; return $null }
 function Test-StrongKeyword([string]$T) { if (-not $T) { return $null }; $l = $T.ToLower(); foreach ($k in $StrongKeywords) { if ($l -match [regex]::Escape($k)) { return $k } }; return $null }
 function Test-GamingAllowlist([string]$T) { if (-not $T) { return $false }; $l = $T.ToLower(); foreach ($k in $GamingAllowlist) { if ($l -match [regex]::Escape($k)) { return $true } }; return $false }
+
+# Filename normalisation: strip extension, drop everything that is not a letter or digit, then
+# drop trailing version digits and one executor-style suffix. "Solara Bootstrapper (2).exe"
+# becomes "solara", "xeno-1.0.3.exe" becomes "xeno".
+function Get-NormalizedName([string]$Name) {
+    if (-not $Name) { return '' }
+    $l = $Name.ToLowerInvariant().Trim()
+    if ($l -match '\.(exe|dll|sys|msi|bat|cmd|ps1|lnk|scr|com)$') { $l = $l -replace '\.(exe|dll|sys|msi|bat|cmd|ps1|lnk|scr|com)$','' }
+    $l = ($l.ToCharArray() | Where-Object { ($_ -ge 'a' -and $_ -le 'z') -or ($_ -ge '0' -and $_ -le '9') }) -join ''
+    if (-not $l) { return '' }
+    $end = $l.Length
+    while ($end -gt 0 -and $l[$end-1] -ge '0' -and $l[$end-1] -le '9') { $end-- }
+    if ($end -gt 0 -and $end -lt $l.Length) { $l = $l.Substring(0,$end) }
+    return $l
+}
+function Get-CheatNameMatch([string]$Name) {
+    $n = Get-NormalizedName $Name
+    if ($n.Length -lt 3) { return $null }
+    if ($CheatStems -contains $n) { return $n }
+    foreach ($suf in $StemSuffixes) {
+        if ($n.Length -gt $suf.Length -and $n.EndsWith($suf)) {
+            $stem = $n.Substring(0, $n.Length - $suf.Length)
+            if ($CheatStems -contains $stem -or $StemOnlyNames -contains $stem) { return $n }
+        }
+    }
+    return $null
+}
 
 # ---------------------------------------------------------------------------
 # Archive + delivery (defined early so Set-Phase can checkpoint)
@@ -422,10 +469,15 @@ if ($Baseline -and (Test-Path $Baseline)) {
 Add-Type -ReferencedAssemblies @('System','System.Drawing','System.Windows.Forms') -Language CSharp -TypeDefinition @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 
 namespace SA {
@@ -438,6 +490,8 @@ namespace SA {
   public class MemRec { public ulong Base; public ulong Size; public uint Protect; public bool Rwx; }
   public class ProcRec { public int Pid; public string Name; }
   public class RuleHit { public string Rule; public int Weight; public ulong Base; public string Patterns; }
+  public class WRec { public uint Pid; public uint ParentPid; public string Name; public string Path; public string Cmd; public string Ancestry; public string OriginName; public string OriginCmd; public string OriginPath; public double LifetimeMs; public bool HasExited; }
+  public class HRec { public uint OwnerPid; public string OwnerName; public string OwnerPath; public string AccessDesc; public string Sig; public string Injection; }
 
   public static class N {
     [StructLayout(LayoutKind.Sequential)] public struct MBI { public ulong BaseAddress, AllocationBase; public uint AllocProtect, A1; public ulong RegionSize; public uint State, Protect, Type, A2; }
@@ -446,6 +500,7 @@ namespace SA {
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct MODW { public uint Size, ModId, Pid, Glbl, Proc; public IntPtr Base; public uint BaseSize; public IntPtr Handle; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=256)] public string Name; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string Path; }
     [StructLayout(LayoutKind.Sequential)] public struct LUID { public uint Low; public int High; }
     [StructLayout(LayoutKind.Sequential)] public struct LAA { public LUID Luid; public uint Attr; }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct PE32 { public uint Size, Usage, Pid, ParentPid; public int Pri, Dflt; public IntPtr Id; public uint Threads, ParentUnk; public int BasePri, DeltaPri; public uint Flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string Name; }
 
     [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint a, bool i, uint p);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
@@ -454,6 +509,7 @@ namespace SA {
     [DllImport("kernel32.dll")] public static extern uint GetProcessId(IntPtr p);
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool QueryFullProcessImageName(IntPtr h, uint f, StringBuilder n, ref uint s);
     [DllImport("ntdll.dll")] public static extern uint NtQuerySystemInformation(int c, IntPtr b, uint l, out uint r);
+    [DllImport("ntdll.dll")] public static extern int NtQueryInformationProcess(IntPtr h, int c, IntPtr b, int l, out int r);
     [DllImport("kernel32.dll")] public static extern IntPtr VirtualQueryEx(IntPtr p, IntPtr a, out MBI m, IntPtr l);
     [DllImport("kernel32.dll")] public static extern bool ReadProcessMemory(IntPtr p, IntPtr a, byte[] b, IntPtr s, out IntPtr r);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateToolhelp32Snapshot(uint f, uint p);
@@ -476,6 +532,24 @@ namespace SA {
       if (h == IntPtr.Zero) return "";
       try { var sb = new StringBuilder(1024); uint s = (uint)sb.Capacity; return QueryFullProcessImageName(h, 0, sb, ref s) ? sb.ToString() : ""; }
       finally { CloseHandle(h); }
+    }
+
+    public static string CmdLine(uint pid) {
+      IntPtr h = OpenProcess(0x1000, false, pid);
+      if (h == IntPtr.Zero) return "";
+      try {
+        int need; NtQueryInformationProcess(h, 60, IntPtr.Zero, 0, out need);
+        if (need <= 0 || need > 0x20000) need = 0x2000;
+        IntPtr b = Marshal.AllocHGlobal(need);
+        try {
+          if (NtQueryInformationProcess(h, 60, b, need, out need) != 0) return "";
+          int len = (ushort)Marshal.ReadInt16(b);
+          IntPtr p = Marshal.ReadIntPtr(b, IntPtr.Size);
+          if (len <= 0 || p == IntPtr.Zero) return "";
+          string s = Marshal.PtrToStringUni(p, len / 2);
+          return s.Length > 1500 ? s.Substring(0, 1500) + "..." : s;
+        } finally { Marshal.FreeHGlobal(b); }
+      } catch { return ""; } finally { CloseHandle(h); }
     }
 
     public static List<ProcRec> ProcessList() {
@@ -539,7 +613,7 @@ namespace SA {
         long count = Marshal.ReadInt64(buf);
         IntPtr cur = new IntPtr(buf.ToInt64() + 16);
         int esz = Marshal.SizeOf(typeof(SHE));
-        uint me = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        uint me = (uint)Process.GetCurrentProcess().Id;
         var cache = new Dictionary<uint, IntPtr>();
         for (long i = 0; i < count; i++) {
           var e = (SHE)Marshal.PtrToStructure(cur, typeof(SHE));
@@ -556,7 +630,7 @@ namespace SA {
             try {
               if (targets.Contains(GetProcessId(dup))) {
                 string nm = "Unknown";
-                try { nm = System.Diagnostics.Process.GetProcessById((int)owner).ProcessName; } catch {}
+                try { nm = Process.GetProcessById((int)owner).ProcessName; } catch {}
                 outp.Add(new HandleRec { OwnerPid = owner, OwnerName = nm, OwnerPath = PathOf(owner), Access = a, AccessDesc = Desc(a) });
               }
             } finally { CloseHandle(dup); }
@@ -565,6 +639,43 @@ namespace SA {
         foreach (var kv in cache) if (kv.Value != IntPtr.Zero) CloseHandle(kv.Value);
       } catch {} finally { Marshal.FreeHGlobal(buf); }
       return outp;
+    }
+
+    // What the handle owner has actually done to itself: unbacked executable regions and
+    // unsigned modules outside the Windows directory.
+    public static string Inject(uint pid) {
+      var l = new List<string>();
+      IntPtr h = OpenProcess(0x410, false, pid);
+      if (h != IntPtr.Zero) {
+        try {
+          IntPtr a = IntPtr.Zero; IntPtr msz = new IntPtr(Marshal.SizeOf(typeof(MBI)));
+          int cnt = 0; ulong tot = 0; int guard = 0;
+          while (guard++ < 100000) {
+            MBI m;
+            if (VirtualQueryEx(h, a, out m, msz) == IntPtr.Zero) break;
+            if (m.State == 0x1000 && m.Type == 0x20000 && (m.Protect & 0xF0) != 0) { cnt++; tot += m.RegionSize; }
+            long nx = (long)(m.BaseAddress + m.RegionSize);
+            if (nx <= a.ToInt64()) break;
+            a = new IntPtr(nx);
+          }
+          if (cnt > 0) l.Add("unbacked exec " + cnt + " region(s)/" + tot + "B");
+        } catch {} finally { CloseHandle(h); }
+      }
+      try {
+        using (var p = Process.GetProcessById((int)pid)) {
+          foreach (ProcessModule mo in p.Modules) {
+            try {
+              string f = mo.FileName;
+              if (string.IsNullOrEmpty(f) || !File.Exists(f)) continue;
+              if (f.ToLower().StartsWith(@"c:\windows\")) continue;
+              bool signed = false;
+              try { signed = X509Certificate.CreateFromSignedFile(f) != null; } catch {}
+              if (!signed) l.Add("unsigned dll " + Path.GetFileName(f));
+            } catch {}
+          }
+        }
+      } catch {}
+      return string.Join(" | ", l.ToArray());
     }
 
     public static List<HollowRec> Hollow(int pid, string name) {
@@ -686,6 +797,391 @@ namespace SA {
     }
   }
 
+  // 75 ms process watchdog: every new process since start, with parent chain, the first
+  // non-shell ancestor that actually launched it, its command line, and its lifetime so a
+  // loader that lives 200 ms is still reported.
+  public static class WD {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct PE { public uint Size, Usage, Pid; public IntPtr Heap; public uint Mod, Threads, Parent; public int Pri, Dflt; public uint Flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string Name; }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint f, uint p);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32FirstW(IntPtr s, ref PE e);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32NextW(IntPtr s, ref PE e);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a, bool i, uint p);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, uint f, StringBuilder n, ref uint s);
+
+    class Seen { public string Name; public uint Parent; public long Tick; }
+    static Thread th;
+    static volatile bool run;
+    static readonly HashSet<uint> basePids = new HashSet<uint>();
+    static readonly Dictionary<uint, Seen> seen = new Dictionary<uint, Seen>();
+    static readonly Dictionary<uint, long> started = new Dictionary<uint, long>();
+    static readonly HashSet<uint> tracked = new HashSet<uint>();
+    static readonly Queue<WRec> q = new Queue<WRec>();
+    static readonly object lk = new object();
+    static readonly HashSet<string> shells = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "cmd.exe","conhost.exe","openconsole.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe" };
+
+    static string PathOf(uint pid) {
+      IntPtr h = OpenProcess(0x1000, false, pid);
+      if (h == IntPtr.Zero) return "";
+      try { var sb = new StringBuilder(1024); uint s = (uint)sb.Capacity; return QueryFullProcessImageName(h, 0, sb, ref s) ? sb.ToString() : ""; }
+      finally { CloseHandle(h); }
+    }
+
+    public static void Start(int intervalMs) {
+      if (run) return;
+      run = true;
+      IntPtr s0 = CreateToolhelp32Snapshot(0x2, 0);
+      if (s0 != IntPtr.Zero && s0.ToInt64() != -1) {
+        try {
+          var e = new PE(); e.Size = (uint)Marshal.SizeOf(typeof(PE));
+          long t0 = Stopwatch.GetTimestamp();
+          if (Process32FirstW(s0, ref e)) { do { basePids.Add(e.Pid); seen[e.Pid] = new Seen { Name = e.Name, Parent = e.Parent, Tick = t0 }; } while (Process32NextW(s0, ref e)); }
+        } finally { CloseHandle(s0); }
+      }
+      th = new Thread(delegate() {
+        while (run) {
+          try {
+            IntPtr s = CreateToolhelp32Snapshot(0x2, 0);
+            if (s != IntPtr.Zero && s.ToInt64() != -1) {
+              var snap = new List<PE>();
+              var cur = new HashSet<uint>();
+              try {
+                var e = new PE(); e.Size = (uint)Marshal.SizeOf(typeof(PE));
+                if (Process32FirstW(s, ref e)) { do { snap.Add(e); } while (Process32NextW(s, ref e)); }
+              } finally { CloseHandle(s); }
+              long now = Stopwatch.GetTimestamp();
+              foreach (var e in snap) {
+                cur.Add(e.Pid);
+                Seen sn;
+                if (seen.TryGetValue(e.Pid, out sn) && sn.Name == e.Name) sn.Tick = now;
+                else seen[e.Pid] = new Seen { Name = e.Name, Parent = e.Parent, Tick = now };
+              }
+              long stale = Stopwatch.Frequency * 60;
+              var drop = new List<uint>();
+              foreach (var kv in seen) if (now - kv.Value.Tick > stale) drop.Add(kv.Key);
+              foreach (var d in drop) seen.Remove(d);
+
+              foreach (var e in snap) {
+                if (basePids.Contains(e.Pid)) continue;
+                lock (lk) {
+                  if (tracked.Add(e.Pid)) {
+                    var r = new WRec { Pid = e.Pid, ParentPid = e.Parent, Name = e.Name, Path = PathOf(e.Pid) };
+                    r.Cmd = N.CmdLine(e.Pid);
+                    var chain = new List<string>();
+                    uint c = e.Parent; var vis = new HashSet<uint>(); vis.Add(e.Pid);
+                    for (int d2 = 0; d2 < 6 && c != 0 && !vis.Contains(c); d2++) {
+                      vis.Add(c);
+                      Seen sp;
+                      if (!seen.TryGetValue(c, out sp)) { chain.Add("PID " + c + " (exited)"); break; }
+                      chain.Add(sp.Name + " (" + c + ")");
+                      if (!shells.Contains(sp.Name)) { r.OriginName = sp.Name; r.OriginPath = PathOf(c); r.OriginCmd = N.CmdLine(c); break; }
+                      c = sp.Parent;
+                    }
+                    chain.Reverse(); chain.Add(e.Name + " (" + e.Pid + ")");
+                    r.Ancestry = string.Join(" > ", chain.ToArray());
+                    started[e.Pid] = now;
+                    if (q.Count < 800) q.Enqueue(r);
+                  }
+                }
+              }
+              lock (lk) {
+                var gone = new List<uint>();
+                foreach (var pid in tracked) if (!cur.Contains(pid)) gone.Add(pid);
+                foreach (var pid in gone) {
+                  long st;
+                  if (started.TryGetValue(pid, out st)) {
+                    foreach (var r in q) if (r.Pid == pid) { r.LifetimeMs = Math.Round((double)(Stopwatch.GetTimestamp() - st) * 1000.0 / Stopwatch.Frequency, 1); r.HasExited = true; }
+                  }
+                  tracked.Remove(pid); started.Remove(pid);
+                }
+              }
+            }
+          } catch {}
+          Thread.Sleep(intervalMs);
+        }
+      }) { IsBackground = true, Priority = ThreadPriority.Lowest, Name = "SAWatchdog" };
+      th.Start();
+    }
+
+    public static void Stop() { run = false; }
+
+    public static WRec[] Drain() {
+      lock (lk) {
+        if (q.Count == 0) return new WRec[0];
+        var a = q.ToArray(); q.Clear(); return a;
+      }
+    }
+  }
+
+  // Continuous Roblox handle watchdog. Each distinct owner/access pair is reported once with
+  // its own injection state.
+  public static class HW {
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a, bool i, uint p);
+    [DllImport("kernel32.dll")] static extern bool DuplicateHandle(IntPtr s, IntPtr sh, IntPtr t, out IntPtr th, uint a, bool i, uint o);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern uint GetProcessId(IntPtr p);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ntdll.dll")] static extern uint NtQuerySystemInformation(int c, IntPtr b, uint l, out uint r);
+
+    [StructLayout(LayoutKind.Sequential)] struct SHE { public IntPtr Object, UniqueProcessId, HandleValue; public uint Access; public ushort BT, TI; public uint Attr, Res; }
+
+    static Thread th;
+    static volatile bool run;
+    static readonly object lk = new object();
+    static readonly HashSet<string> done = new HashSet<string>();
+    static readonly Queue<HRec> q = new Queue<HRec>();
+
+    static string Desc(uint a) {
+      if ((a & 0x1FFFFF) == 0x1FFFFF) return "ALL_ACCESS";
+      var l = new List<string>();
+      if ((a & 0x10) != 0) l.Add("VM_READ");
+      if ((a & 0x20) != 0) l.Add("VM_WRITE");
+      if ((a & 0x8)  != 0) l.Add("VM_OPERATION");
+      if ((a & 0x2)  != 0) l.Add("CREATE_THREAD");
+      return l.Count > 0 ? string.Join("|", l.ToArray()) : ("0x" + a.ToString("X"));
+    }
+
+    public static void ScanOnce() {
+      uint[] targets;
+      try { targets = GetTargets(); } catch { return; }
+      if (targets == null || targets.Length == 0) return;
+      var tg = new HashSet<uint>(targets);
+      uint sz = 1 << 22, ret;
+      IntPtr buf = Marshal.AllocHGlobal((int)sz);
+      try {
+        uint st = NtQuerySystemInformation(64, buf, sz, out ret);
+        while (st == 0xC0000004) { Marshal.FreeHGlobal(buf); sz = Math.Max(sz * 2, ret + (1 << 20)); buf = Marshal.AllocHGlobal((int)sz); st = NtQuerySystemInformation(64, buf, sz, out ret); }
+        if (st != 0) return;
+        long count = Marshal.ReadInt64(buf);
+        IntPtr cur = new IntPtr(buf.ToInt64() + 16);
+        int esz = Marshal.SizeOf(typeof(SHE));
+        uint me = (uint)Process.GetCurrentProcess().Id;
+        var cache = new Dictionary<uint, IntPtr>();
+        for (long i = 0; i < count; i++) {
+          var e = (SHE)Marshal.PtrToStructure(cur, typeof(SHE));
+          cur = new IntPtr(cur.ToInt64() + esz);
+          uint owner = (uint)e.UniqueProcessId.ToInt64();
+          if (owner <= 4 || owner == me) continue;
+          uint a = e.Access;
+          if ((a & 0x10) == 0 && (a & 0x20) == 0 && (a & 0x8) == 0 && (a & 0x2) == 0 && (a & 0x1FFFFF) != 0x1FFFFF) continue;
+          IntPtr ho;
+          if (!cache.TryGetValue(owner, out ho)) { ho = OpenProcess(0x40, false, owner); cache[owner] = ho; }
+          if (ho == IntPtr.Zero) continue;
+          IntPtr dup;
+          if (DuplicateHandle(ho, e.HandleValue, GetCurrentProcess(), out dup, 0, false, 2)) {
+            try {
+              if (tg.Contains(GetProcessId(dup))) {
+                string key = owner + "|" + a;
+                lock (lk) { if (!done.Add(key)) continue; }
+                string nm = "Unknown";
+                try { nm = Process.GetProcessById((int)owner).ProcessName; } catch {}
+                string p = N.PathOf(owner);
+                string sig = "Unsigned";
+                try { sig = X509Certificate.CreateFromSignedFile(p) != null ? "Signed" : "Unsigned"; } catch {}
+                lock (lk) { if (q.Count < 400) q.Enqueue(new HRec { OwnerPid = owner, OwnerName = nm, OwnerPath = p, AccessDesc = Desc(a), Sig = sig, Injection = N.Inject(owner) }); }
+              }
+            } finally { CloseHandle(dup); }
+          }
+        }
+        foreach (var kv in cache) if (kv.Value != IntPtr.Zero) CloseHandle(kv.Value);
+      } catch {} finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    static uint[] GetTargets() {
+      var l = new List<uint>();
+      foreach (string n in new string[] { "RobloxPlayerBeta", "RobloxPlayer", "Roblox" }) {
+        try { foreach (var p in Process.GetProcessesByName(n)) l.Add((uint)p.Id); } catch {}
+      }
+      return l.ToArray();
+    }
+
+    public static void Start(int intervalMs) {
+      if (run) return;
+      run = true;
+      th = new Thread(delegate() { while (run) { try { ScanOnce(); } catch {} Thread.Sleep(intervalMs); } }) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = "SAHandles" };
+      th.Start();
+    }
+
+    public static void Stop() { run = false; }
+
+    public static HRec[] Drain() {
+      lock (lk) { if (q.Count == 0) return new HRec[0]; var a = q.ToArray(); q.Clear(); return a; }
+    }
+  }
+
+  // Low-level mouse hook counting input Windows marks as injected while Roblox is foreground.
+  public class IM : IDisposable {
+    const int WH_MOUSE_LL = 14;
+    const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_RBUTTONDOWN = 0x204;
+    const uint INJ = 1, LIL = 2;
+    delegate IntPtr HookProc(int code, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SetWindowsHookExW(int id, HookProc p, IntPtr m, uint t);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int c, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern int GetMessageW(out MSG m, IntPtr h, uint a, uint b);
+    [DllImport("user32.dll")] static extern bool PostThreadMessageW(uint t, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr GetModuleHandleW(string n);
+    [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr h; public uint m; public IntPtr w, l; public uint t; public int x, y; }
+
+    readonly object lk = new object();
+    HookProc proc;
+    Thread th, watch;
+    uint tid;
+    IntPtr hook;
+    ManualResetEvent stopW;
+    volatile bool front;
+    long moves, injMoves, injClicks;
+    public string Status = "Not started";
+    public bool Running { get { return hook != IntPtr.Zero; } }
+
+    public void Start() {
+      if (th != null) return;
+      var ready = new ManualResetEvent(false);
+      th = new Thread(delegate() {
+        tid = GetCurrentThreadId();
+        proc = Callback;
+        hook = SetWindowsHookExW(WH_MOUSE_LL, proc, GetModuleHandleW(null), 0);
+        Status = hook != IntPtr.Zero ? "Active" : "Hook failed (" + Marshal.GetLastWin32Error() + ")";
+        ready.Set();
+        if (hook == IntPtr.Zero) return;
+        MSG m;
+        while (GetMessageW(out m, IntPtr.Zero, 0, 0) > 0) { }
+        UnhookWindowsHookEx(hook); hook = IntPtr.Zero;
+      }) { IsBackground = true, Priority = ThreadPriority.AboveNormal, Name = "SAInput" };
+      th.Start();
+      ready.WaitOne(5000);
+      if (hook == IntPtr.Zero) return;
+      stopW = new ManualResetEvent(false);
+      var sw = stopW;
+      watch = new Thread(delegate() {
+        do {
+          try { uint p; GetWindowThreadProcessId(GetForegroundWindow(), out p); front = IsGame(p); } catch {}
+        } while (!sw.WaitOne(250));
+      }) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = "SAInputFg" };
+      watch.Start();
+    }
+
+    IntPtr Callback(int code, IntPtr w, IntPtr l) {
+      if (code >= 0) {
+        try {
+          int m = w.ToInt32();
+          uint f = (uint)Marshal.ReadInt32(l, 12);
+          bool inj = (f & (INJ | LIL)) != 0;
+          lock (lk) {
+            if (m == WM_MOUSEMOVE) moves++;
+            if (front && inj) { if (m == WM_MOUSEMOVE) injMoves++; else if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN) injClicks++; }
+          }
+        } catch {}
+      }
+      return CallNextHookEx(IntPtr.Zero, code, w, l);
+    }
+
+    uint gp; int gt;
+    bool IsGame(uint pid) {
+      if (pid == 0) return false;
+      int n = Environment.TickCount;
+      if (pid == gp && n - gt < 10000) return true;
+      try { using (var p = Process.GetProcessById((int)pid)) { if (p.ProcessName != "RobloxPlayerBeta") return false; } gp = pid; gt = n; return true; } catch { return false; }
+    }
+
+    public Dictionary<string, object> Snapshot() {
+      var d = new Dictionary<string, object>();
+      lock (lk) {
+        d["status"] = Status; d["moves"] = moves; d["injectedMoves"] = injMoves; d["injectedClicks"] = injClicks;
+        d["detected"] = injClicks >= 5 || injMoves >= 100; d["review"] = injClicks > 0 || injMoves > 0;
+      }
+      return d;
+    }
+
+    public void Dispose() {
+      if (th == null) return;
+      if (stopW != null) stopW.Set();
+      PostThreadMessageW(tid, 0x12, IntPtr.Zero, IntPtr.Zero);
+      th.Join(2000); if (watch != null) watch.Join(2000);
+      th = watch = null; stopW = null;
+    }
+  }
+
+  // Trusted Root Program check: a root that is not in the Microsoft-distributed CTL, not in
+  // the AuthRoot store and not accepted by the Microsoft root policy was installed by hand.
+  public static class Trust {
+    [StructLayout(LayoutKind.Sequential)] struct PCP { public uint cb; public uint flags; public IntPtr extra; }
+    [StructLayout(LayoutKind.Sequential)] struct PCS { public uint cb; public uint err; public int ci; public int ei; public IntPtr extra; }
+    [DllImport("crypt32.dll")] static extern bool CertVerifyCertificateChainPolicy(IntPtr oid, IntPtr ctx, ref PCP p, ref PCS s);
+
+    static readonly object sync = new object();
+    static readonly Dictionary<string, bool> cache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    static byte[] ctl;
+
+    static bool InProgram(X509Certificate2 root) {
+      if (ctl == null) {
+        byte[] c = null;
+        try { c = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\SystemCertificates\AuthRoot\AutoUpdate", "EncodedCtl", null) as byte[]; } catch {}
+        ctl = c ?? new byte[0];
+      }
+      byte[] h = root.GetCertHash();
+      for (int i = 0; i + h.Length <= ctl.Length; i++) {
+        if (ctl[i] != h[0]) continue;
+        int j = 1;
+        while (j < h.Length && ctl[i + j] == h[j]) j++;
+        if (j == h.Length) return true;
+      }
+      return false;
+    }
+
+    static bool InAuthRoot(string thumb) {
+      X509Store s = new X509Store(StoreName.AuthRoot, StoreLocation.LocalMachine);
+      try { s.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly); return s.Certificates.Find(X509FindType.FindByThumbprint, thumb, false).Count > 0; }
+      catch { return false; } finally { s.Close(); }
+    }
+
+    static bool MsPolicy(X509Chain ch) {
+      var p = new PCP(); p.cb = (uint)Marshal.SizeOf(typeof(PCP)); p.flags = 0x20000;
+      var s = new PCS(); s.cb = (uint)Marshal.SizeOf(typeof(PCS));
+      return CertVerifyCertificateChainPolicy(new IntPtr(7), ch.ChainContext, ref p, ref s) && s.err == 0;
+    }
+
+    public static bool RogueRoot(X509Certificate2 leaf) {
+      if (leaf == null) return false;
+      using (var ch = new X509Chain()) {
+        ch.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        ch.ChainPolicy.VerificationFlags = X509VerificationFlags.IgnoreNotTimeValid;
+        ch.Build(leaf);
+        if (ch.ChainElements.Count == 0) return false;
+        var root = ch.ChainElements[ch.ChainElements.Count - 1].Certificate;
+        bool rogue;
+        lock (sync) { if (cache.TryGetValue(root.Thumbprint, out rogue)) return rogue; }
+        rogue = !InProgram(root) && !InAuthRoot(root.Thumbprint) && !MsPolicy(ch);
+        lock (sync) cache[root.Thumbprint] = rogue;
+        return rogue;
+      }
+    }
+  }
+
+  public static class PF {
+    [DllImport("ntdll.dll")] static extern uint RtlGetCompressionWorkSpaceSize(ushort f, out uint w, out uint g);
+    [DllImport("ntdll.dll")] static extern uint RtlDecompressBufferEx(ushort f, byte[] o, int os, byte[] i, int il, out int fin, byte[] ws);
+
+    public static byte[] Read(string path) {
+      byte[] raw;
+      try { raw = File.ReadAllBytes(path); } catch { return null; }
+      if (raw.Length < 8) return null;
+      if (raw[0] != 0x4D || raw[1] != 0x41 || raw[2] != 0x4D) return raw;
+      int size = BitConverter.ToInt32(raw, 4);
+      if (size <= 0 || size > 64 * 1024 * 1024) return null;
+      uint ws, frag;
+      if (RtlGetCompressionWorkSpaceSize(4, out ws, out frag) != 0) return null;
+      byte[] inp = new byte[raw.Length - 8];
+      Buffer.BlockCopy(raw, 8, inp, 0, inp.Length);
+      byte[] o = new byte[size];
+      int fin;
+      return RtlDecompressBufferEx(4, o, size, inp, inp.Length, out fin, new byte[ws]) == 0 ? o : null;
+    }
+  }
+
   public static class Y {
     static int Find(byte[] b, byte[] p) {
       if (p.Length == 0 || p.Length > b.Length) return -1;
@@ -762,7 +1258,7 @@ namespace SA {
 
     public static List<WinRec> Scan() {
       var l = new List<WinRec>();
-      uint me = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+      uint me = (uint)Process.GetCurrentProcess().Id;
       var seen = new HashSet<uint>();
       EnumWindows(delegate(IntPtr h, IntPtr x) {
         try {
@@ -802,7 +1298,7 @@ namespace SA {
         long next = BitConverter.ToInt64(q, 8);
         DateTime since = DateTime.UtcNow - window;
         byte[] req = new byte[40]; byte[] buf = new byte[1 << 20];
-        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var clock = Stopwatch.StartNew();
         while (clock.Elapsed.TotalSeconds < 15 && l.Count < max) {
           BitConverter.GetBytes(next).CopyTo(req, 0);
           BitConverter.GetBytes(0x100 | 0x200 | 0x2000).CopyTo(req, 8);
@@ -830,6 +1326,19 @@ namespace SA {
         }
       }
       return l;
+    }
+
+    // Journal ID is its creation time, so a recent one means the journal was deleted
+    public static DateTime? JournalCreated() {
+      string drive = System.IO.Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows)).TrimEnd('\\');
+      using (var v = CreateFileW(@"\\.\" + drive, 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+        if (v.IsInvalid) return null;
+        byte[] q = new byte[80]; int got;
+        if (!DeviceIoControl(v, 0x000900F4, null, 0, q, q.Length, out got, IntPtr.Zero)) return null;
+        long id = BitConverter.ToInt64(q, 0);
+        if (id <= 0) return null;
+        try { return DateTime.FromFileTimeUtc(id); } catch { return null; }
+      }
     }
   }
 
@@ -868,15 +1377,29 @@ function Get-SigVerdict([string]$Path) {
     $ch.ChainPolicy.RevocationMode = 'NoCheck'
     $null = $ch.Build($cert)
     $n = $ch.ChainElements.Count
-    $root = if ($n -gt 0) { $ch.ChainElements[$n-1].Certificate } else { $null }
+    # A root counts only if Windows distributed it: Trusted Root Program CTL, AuthRoot store or
+    # the Microsoft root policy. Presence in the Root store alone is not enough.
     $genuine = $false
-    if ($root) { $genuine = (Test-Path "Cert:\LocalMachine\AuthRoot\$($root.Thumbprint)") -or ($root.Subject -like '*Microsoft*') }
+    if ($n -gt 0) {
+        if ('SA.Trust' -as [type]) { $genuine = -not [SA.Trust]::RogueRoot($cert) }
+        else {
+            $root = $ch.ChainElements[$n-1].Certificate
+            if ($root) { $genuine = (Test-Path "Cert:\LocalMachine\AuthRoot\$($root.Thumbprint)") -or ($root.Subject -like '*Microsoft*') }
+        }
+    }
     if ($cert.Subject -eq $cert.Issuer -or $n -le 1) { $r.Verdict = if ($genuine) { 'Valid' } else { 'SelfSignedCert' }; $SigCache[$Path]=$r; return $r }
     if ($sig -and $sig.Status -eq 'HashMismatch') { $r.Verdict='TamperedBinary'; $SigCache[$Path]=$r; return $r }
     if ($sig -and ($sig.Status -eq 'NotTrusted' -or $sig.StatusMessage -like '*untrusted root*')) { $r.Verdict='UntrustedRoot'; $SigCache[$Path]=$r; return $r }
     if ($sig -and $sig.Status -ne 'Valid' -and -not $sig.TimeStamperCertificate -and $cert.NotAfter -lt (Get-Date) -and -not $Path.StartsWith($WinRoot,'OrdinalIgnoreCase')) { $r.Verdict='ExpiredCertificate'; $SigCache[$Path]=$r; return $r }
     $r.Verdict = if ($genuine) { 'Valid' } else { 'RogueRootCA' }
     $SigCache[$Path]=$r; return $r
+}
+
+function Test-WindowsInboxDriver([string]$Path) {
+    if (-not $Path) { return $false }
+    if (-not ($Path.StartsWith("$WinRoot\System32\drivers\",'OrdinalIgnoreCase') -or $Path.StartsWith("$WinRoot\System32\DriverStore\",'OrdinalIgnoreCase'))) { return $false }
+    $vi = try { (Get-Item -LiteralPath $Path).VersionInfo } catch { $null }
+    return [bool]($vi -and $vi.CompanyName -eq 'Microsoft Corporation' -and ($vi.ProductName -like '*Windows*' -or $vi.LegalCopyright -like '*Microsoft*'))
 }
 
 function Get-CachedHash([string]$Path) {
@@ -962,6 +1485,8 @@ function Invoke-BinaryEvaluation {
     if ($hash -and $UnconfirmedHashes.ContainsKey($hash)) { Add-Finding Review $Source $Name "PID $ProcessId" "Unconfirmed sample hash: $($UnconfirmedHashes[$hash])" '' 'Confirm manually' -Score 25 -Confidence Medium -Evidence @("SHA256 $hash"); return }
     $str = Get-CheatStrings $Path
     if ($str -and $str.Strong) { Add-Finding Detected $Source $Name "PID $ProcessId" "Cheat string signature: $($str.Family) [$($str.Markers -join ', ')]" '' 'Verify origin' -Score 55 -Confidence High -Evidence @("Markers: $($str.Markers -join ', ')"); return }
+    $stem = Get-CheatNameMatch $Name
+    if ($stem) { Add-Finding Detected $Source $Name "PID $ProcessId" "Normalised filename is a cheat name: $stem" '' 'A name match alone is not proof' -Score 32 -Confidence Medium -Evidence @("Stem '$stem'"); return }
     $strong = Test-StrongKeyword $Name
     if ($strong) { Add-Finding Detected $Source $Name "PID $ProcessId" "Strong cheat keyword in name: $strong" '' 'A name match alone is not proof' -Score 30 -Confidence Medium -Evidence @("Keyword '$strong'"); return }
     if ($str) { Add-Finding Review $Source $Name "PID $ProcessId" "Single string marker: $($str.Family) [$($str.Markers -join ', ')]" '' '' -Score 12 -Confidence Low; return }
@@ -1065,7 +1590,7 @@ try {
     $ldb = Join-Path $env:APPDATA 'discord\Local Storage\leveldb'
     if (Test-Path $ldb) { $f2 = @(); foreach ($f in (Get-ChildItem $ldb -File -EA SilentlyContinue | Select-Object -First 20)) { try { $fs = [IO.File]::Open($f.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete); try { $buf = New-Object byte[] ([int]$fs.Length); $null = $fs.Read($buf,0,$buf.Length); $t = [Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Dispose() }; foreach ($m in [regex]::Matches($t,'"user_id":"(\d{17,20})"')) { $f2 += $m.Groups[1].Value } } catch { if ($Error.Count -gt 0) { $Error.RemoveAt(0) } } }; $f2 = @($f2 | Select-Object -Unique -First 3); if ($f2.Count) { Add-IdLine "Discord IDs: $($f2 -join ', ')" } }
 } catch {}
-try { $idLines | Set-Content -LiteralPath (Join-Path $OutDir 'identity.txt') -Encoding UTF8 -EA Stop; Set-Phase 'Identity' 'Completed' } catch { Set-Phase 'Identity' 'Failed' }
+try { $idLines | Set-Content -LiteralPath (Join-Path $OutDir 'identity.txt') -Encoding UTF8 -EA Stop; Set-Phase 'Identity' 'Completed' } catch { Set-Phase 'Identity ' 'Failed' }
 
 # ============================================================================
 # 3. Rootkit checks: hidden processes and unbacked kernel modules
@@ -1220,18 +1745,39 @@ if ($roblox.Count -gt 0) {
     $hs = @{}
     foreach ($h in [SA.N]::Handles($tp)) {
         $k = "$($h.OwnerPid)-$($h.Access)"; if ($hs.ContainsKey($k)) { continue }; $hs[$k]=1
+        $Stats.Handles++
         $sv = Get-SigVerdict $h.OwnerPath
         if ($sv.Verdict -eq 'Valid' -and $h.OwnerPath.StartsWith($WinRoot,'OrdinalIgnoreCase')) { continue }
         if ($h.OwnerName -eq 'RobloxCrashHandler') { continue }
-        if (($HandleOwnerAllowlist -contains $h.OwnerName) -and $sv.Verdict -ne 'Valid') { Add-Finding Detected 'Memory' "$($h.OwnerName) (identity mismatch)" $h.OwnerPath "Trusted name, signature $($sv.Verdict) [$($h.AccessDesc)]" '' 'Renamed binary holding Roblox handles' -Score 55 -Confidence High }
-        else { Add-Finding Detected 'Memory' "$($h.OwnerName) (PID $($h.OwnerPid))" $h.OwnerPath "Handle to Roblox: $($h.AccessDesc) [sig: $($sv.Verdict)]" '' 'Review owner and signature' -Score 30 -Confidence Medium }
+        # What the owner has done to itself decides the weight: unbacked executable memory or an
+        # injected unsigned module turns a plain handle into an injection finding.
+        $inj = try { [SA.N]::Inject([uint32]$h.OwnerPid) } catch { '' }
+        if ($inj) { $Stats.Injected++ }
+        $suffix = if ($inj) { " | injection: $inj" } else { '' }
+        if (($HandleOwnerAllowlist -contains $h.OwnerName) -and $sv.Verdict -ne 'Valid') { Add-Finding Detected 'Memory' "$($h.OwnerName) (identity mismatch)" $h.OwnerPath "Trusted name, signature $($sv.Verdict) [$($h.AccessDesc)]$suffix" '' 'Renamed binary holding Roblox handles' -Score $(if ($inj) { 70 } else { 55 }) -Confidence High -Evidence @("Injection: $(if($inj){$inj}else{'none'})") }
+        else { Add-Finding Detected 'Memory' "$($h.OwnerName) (PID $($h.OwnerPid))" $h.OwnerPath "Handle to Roblox: $($h.AccessDesc) [sig: $($sv.Verdict)]$suffix" '' 'Review owner and signature' -Score $(if ($inj) { 55 } else { 30 }) -Confidence $(if ($inj) { 'High' } else { 'Medium' }) -Evidence @("Injection: $(if($inj){$inj}else{'none'})") }
         if ([SA.N]::DebugPriv([int]$h.OwnerPid)) { Add-Finding Detected 'Memory' "$($h.OwnerName) (PID $($h.OwnerPid))" $h.OwnerPath 'SeDebugPrivilege held with a Roblox handle' '' '' -Score 20 -Confidence High }
     }
     Set-Phase 'Handle analysis' 'Completed'
 } else { Write-Host '  Roblox not running' -ForegroundColor DarkGray; Set-Phase 'Handle analysis' 'Skipped' }
 
+# Hollowing, plus the parent-anomaly check: svchost must come from services, lsass from wininit.
+$expectedServiceParents = @{ 'svchost' = 'services'; 'lsass' = 'wininit' }
 foreach ($p in (Get-Process -EA SilentlyContinue | Where-Object { $_.Id -gt 4 -and $_.Id -ne $ownPid })) {
-    foreach ($h in [SA.N]::Hollow($p.Id, $p.ProcessName)) { Add-Finding Detected 'Injection' $h.Name "PID $($h.Pid)" ("Private executable PE at 0x{0:X}" -f $h.Base) '' 'Manual-mapped image' -Score 30 -Confidence High }
+    $low = $p.ProcessName.ToLower()
+    $hollow = @([SA.N]::Hollow($p.Id, $p.ProcessName))
+    foreach ($h in $hollow) { Add-Finding Detected 'Injection' $h.Name "PID $($h.Pid)" ("Private executable PE at 0x{0:X}" -f $h.Base) '' 'Manual-mapped image' -Score 30 -Confidence High }
+    if ($expectedServiceParents.ContainsKey($low)) {
+        try {
+            $par = (Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $p.Id) -EA SilentlyContinue).ParentProcessId
+            if ($par) {
+                $pn = try { (Get-Process -Id $par -EA SilentlyContinue).ProcessName } catch { $null }
+                if ($pn -and $pn.ToLower() -ne $expectedServiceParents[$low]) {
+                    Add-Finding Detected 'Injection' "$($p.ProcessName) parent anomaly" "PID $($p.Id)" "Spawned by $pn.exe, expected $($expectedServiceParents[$low]).exe" '' 'Hollowed or relaunched system process' -Score $(if ($hollow.Count) { 55 } else { 30 }) -Confidence High
+                }
+            }
+        } catch {}
+    }
 }
 
 function Test-RobloxThreads { foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) { try { if ([SA.N]::Modules($rp.Id).Count -eq 0) { continue }; foreach ($t in @([SA.N]::Threads($rp.Id) | Where-Object { -not $_.Backed })) { Add-Finding Detected 'Thread' "Thread $($t.Tid)" "PID $($rp.Id)" ("Start 0x{0:X} outside every module" -f $t.Start) '' 'Unbacked thread start is a strong executor signal' -Score 45 -Confidence High } } catch {} } }
@@ -1391,18 +1937,23 @@ foreach ($d in (Get-CimInstance Win32_SystemDriver -EA SilentlyContinue)) {
     $fn = [IO.Path]::GetFileName($pn).ToLower()
     if ($VulnerableDriverNames -contains $fn) { Add-Finding Detected 'Driver' $d.Name $pn 'Known vulnerable driver name' '' 'Unload or note it' -Score 30 -Confidence High }
     if ($script:KnownDriversCache.ContainsKey($fn)) { Add-Finding Detected 'Driver' $d.Name $pn 'Matches the lolDrivers vulnerable list' '' '' -Score 35 -Confidence High }
-    if ($d.State -eq 'Running' -and (Test-Path -LiteralPath $clean)) {
-        $h = Get-CachedHash $clean
-        if ($h -and $script:KnownDriversHashCache.ContainsKey($h.ToLower())) { Add-Finding Detected 'Driver' $d.Name $pn 'Hash matches a known BYOVD sample' '' '' -Score 50 -Confidence High }
-        if ($clean -match '\\(Temp|Downloads)\\') { Add-Finding Detected 'Driver' $d.Name $clean 'Running driver from a user-writable path' '' '' -Score 30 -Confidence High }
-        try { $age = ((Get-Date) - (Get-Item $clean).LastWriteTime).TotalHours; if ($age -lt 24) { Add-Finding Detected 'Driver' $d.Name $clean "Driver written $([int]$age)h ago" '' 'Freshly dropped drivers are high signal' -Score 20 -Confidence High } } catch {}
-        if ((Get-SigVerdict $clean).Verdict -notin 'Valid','Missing') { Add-Finding Detected 'Driver' $d.Name $clean 'Running driver is unsigned/untrusted' '' 'Investigate the source' -Score 40 -Confidence High }
+    if ($d.State -eq 'Running') {
+        # A running driver whose binary is gone was either deleted after load or never existed
+        if (-not (Test-Path -LiteralPath $clean)) { Add-Finding Detected 'Driver' $d.Name $clean 'Running driver has no file on disk' '' 'Dropped-then-deleted driver' -Score 45 -Confidence High }
+        else {
+            $h = Get-CachedHash $clean
+            if ($h -and $script:KnownDriversHashCache.ContainsKey($h.ToLower())) { Add-Finding Detected 'Driver' $d.Name $pn 'Hash matches a known BYOVD sample' '' '' -Score 50 -Confidence High }
+            if ($clean -match '\\(Temp|Downloads)\\') { Add-Finding Detected 'Driver' $d.Name $clean 'Running driver from a user-writable path' '' '' -Score 30 -Confidence High }
+            try { $age = ((Get-Date) - (Get-Item $clean).LastWriteTime).TotalHours; if ($age -lt 24) { Add-Finding Detected 'Driver' $d.Name $clean "Driver written $([int]$age)h ago" '' 'Freshly dropped drivers are high signal' -Score 20 -Confidence High } } catch {}
+            if (-not (Test-WindowsInboxDriver $clean) -and (Get-SigVerdict $clean).Verdict -notin 'Valid','Missing') { Add-Finding Detected 'Driver' $d.Name $clean 'Running driver is unsigned/untrusted' '' 'Investigate the source' -Score 40 -Confidence High }
+        }
     }
 }
 Set-Phase 'Drivers' 'Completed'
 
 foreach ($svc in @('SysMain','PcaSvc','DPS','EventLog')) { $s = Get-Service $svc -EA SilentlyContinue; if ($s -and $s.Status -ne 'Running') { Add-Finding Review 'Tamper' $svc $svc "Service $($s.Status)" '' 'Start it' -Score 10 -Confidence Medium } }
 if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -EA SilentlyContinue).EnablePrefetcher -eq 0) { Add-Finding Review 'Tamper' 'Prefetch' 'EnablePrefetcher' 'Prefetch disabled' '' 'Set to 3' -Score 12 -Confidence High }
+try { $jc = [SA.U]::JournalCreated(); if ($jc -and $jc.Value -gt (Get-Date).AddDays(-2) -and $jc.Value -lt (Get-Date).AddMinutes(10)) { Add-Finding Review 'Tamper' 'Change journal' 'FSCTL_QUERY_USN_JOURNAL' "Journal recreated $($jc.Value.ToString('yyyy-MM-dd HH:mm'))" '' 'Old journal was deleted' -Score 18 -Confidence High } } catch {}
 
 try { foreach ($pp in [IO.Directory]::GetFiles('\\.\pipe\')) { $n = Split-Path $pp -Leaf; if (-not $SeenPipes.Add($n)) { continue }; $Stats.Pipes++; $hit = Get-KeywordMatch $n; if ($hit) { Add-Finding Detected 'Named pipe' $n $pp "Pipe name matches '$hit'" '' '' -Score 25 -Confidence Medium } }; Set-Phase 'Named pipes' 'Completed' } catch { Set-Phase 'Named pipes' 'Failed' }
 
@@ -1413,6 +1964,7 @@ foreach ($r in @(Get-CimInstance Win32_Process -Filter "Name = 'RobloxPlayerBeta
 }
 Set-Phase 'Process tree' 'Completed'
 
+# --- Persistence: Run keys, then the vectors that survive Run-key cleanup -------------
 foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce')) {
     if (-not (Test-Path $k)) { continue }
     $it = Get-Item $k
@@ -1425,7 +1977,69 @@ foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKCU:\SO
     }
 }
 foreach ($sf in @((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'), (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'))) { if (Test-Path $sf) { foreach ($f in (Get-ChildItem $sf -File -EA SilentlyContinue)) { Add-Finding Info 'Startup folder' $f.Name $f.FullName 'Startup entry' '' '' -Score 0 } } }
-try { foreach ($t in (Get-ScheduledTask -EA SilentlyContinue)) { foreach ($a in $t.Actions) { if ($a.Execute -match '\\AppData\\|\\Temp\\|\\Downloads\\') { Add-Finding Review 'Scheduled task' $t.TaskName $a.Execute "Task runs from a user-writable path ($($t.State))" '' '' -Score 12 -Confidence Medium } } }; Set-Phase 'Persistence' 'Completed' } catch { Set-Phase 'Persistence' 'Partial' }
+
+function Get-PersistenceDeep {
+    # IFEO debugger: a Debugger value runs before the target binary, so it survives any cleanup
+    foreach ($base in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options')) {
+        if (-not (Test-Path $base)) { continue }
+        foreach ($sub in (Get-ChildItem $base -EA SilentlyContinue)) {
+            $dbg = try { (Get-ItemProperty -LiteralPath $sub.PSPath -Name Debugger -EA SilentlyContinue).Debugger } catch { $null }
+            if (-not $dbg) { continue }
+            $Stats.Persist++
+            $low = $dbg.ToLower()
+            $isDebloat = ($low -like '*taskkill.exe*' -or $low -like '*systray.exe*')
+            $isDev = ($low -like '*vsjitdebugger.exe*' -or $low -like '*windbg.exe*' -or $low -like '*ntsd.exe*')
+            if ($isDebloat -or $isDev) { continue }
+            $hit = Get-KeywordMatch "$($sub.PSChildName) $dbg"
+            Add-Finding Detected 'IFEO' "$($sub.PSChildName) debugger" $dbg "Debugger hijack$(if($hit){" ('$hit')"})" '' 'ImageFileExecutionOptions debugger' -Score $(if($hit){40}else{25}) -Confidence High
+        }
+    }
+    # AppInit_DLLs / AppCertDlls inject into every process that loads user32
+    foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows')) {
+        if (-not (Test-Path $k)) { continue }
+        $v = (Get-ItemProperty -LiteralPath $k -Name AppInit_DLLs -EA SilentlyContinue).AppInit_DLLs
+        if ($v -and $v.Trim()) { $Stats.Persist++; Add-Finding Detected 'AppInit' 'AppInit_DLLs' $v 'DLL injected into every user32 process' '' 'Global injection point' -Score 30 -Confidence High }
+    }
+    $ac = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls' -EA SilentlyContinue
+    if ($ac) { foreach ($pr in $ac.PSObject.Properties) { if ($pr.Name -notmatch '^PS') { $Stats.Persist++; Add-Finding Detected 'AppCertDlls' $pr.Name "$($pr.Value)" 'AppCertDlls injection point' '' '' -Score 30 -Confidence High } } }
+    # Winlogon Shell / Userinit / Taskman
+    foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon','HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon')) {
+        if (-not (Test-Path $k)) { continue }
+        $sh = (Get-ItemProperty -LiteralPath $k -Name Shell -EA SilentlyContinue).Shell
+        if ($sh -and $sh.Trim().ToLower() -ne 'explorer.exe') { $Stats.Persist++; Add-Finding Detected 'Winlogon' 'Shell' $sh 'Winlogon shell replaced' '' 'Revert to explorer.exe' -Score 35 -Confidence High }
+        $ui = (Get-ItemProperty -LiteralPath $k -Name Userinit -EA SilentlyContinue).Userinit
+        if ($ui -and -not ($ui.ToLower().StartsWith("$WinRoot".ToLower() + 'system32\userinit.exe'))) { $Stats.Persist++; Add-Finding Detected 'Winlogon' 'Userinit' $ui 'Userinit replaced' '' 'Revert to userinit.exe' -Score 35 -Confidence High }
+        $tm = (Get-ItemProperty -LiteralPath $k -Name Taskman -EA SilentlyContinue).Taskman
+        if ($tm) { $Stats.Persist++; Add-Finding Review 'Winlogon' 'Taskman' $tm 'Taskman override set' '' '' -Score 15 -Confidence Medium }
+    }
+    # BootExecute (native pre-session)
+    $be = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -EA SilentlyContinue).BootExecute
+    if ($be) { $s = ($be -join '; '); if ($s -ne 'autocheck autochk *') { $Stats.Persist++; Add-Finding Detected 'BootExecute' 'Session Manager' $s 'BootExecute altered' '' '' -Score 30 -Confidence High } }
+    # LSA Security Packages (runs inside lsass)
+    $sp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -EA SilentlyContinue).'Security Packages'
+    if ($sp) { $known = @('kerberos','msv1_0','schannel','wdigest','tspkg','pku2u','cloudap','negoexts','simplespn'); foreach ($pkg in $sp) { if ($known -notcontains $pkg.ToLower()) { $Stats.Persist++; Add-Finding Detected 'LSA package' $pkg 'Security Packages' 'Non-default LSA security package' '' 'Runs inside lsass' -Score 30 -Confidence High } } }
+    # Active Setup StubPath
+    foreach ($base in @('HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Active Setup\Installed Components')) {
+        if (-not (Test-Path $base)) { continue }
+        foreach ($sub in (Get-ChildItem $base -EA SilentlyContinue)) {
+            $stub = try { (Get-ItemProperty -LiteralPath $sub.PSPath -Name StubPath -EA SilentlyContinue).StubPath } catch { $null }
+            if (-not $stub -or $stub -match '\\Windows\\System32\\') { continue }
+            $Stats.Persist++
+            $hit = Get-KeywordMatch "$($sub.PSChildName) $stub"
+            Add-Finding Review 'Active Setup' $sub.PSChildName $stub "Active Setup stub$(if($hit){" ('$hit')"})" '' '' -Score $(if($hit){25}else{12}) -Confidence Medium
+        }
+    }
+    # WMI permanent event consumer
+    try {
+        foreach ($c in (Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer -EA SilentlyContinue)) {
+            $Stats.Persist++
+            $hit = Get-KeywordMatch "$($c.Name) $($c.ExecutablePath) $($c.CommandLineTemplate)"
+            Add-Finding $(if($hit){'Detected'}else{'Review'}) 'WMI consumer' $c.Name $c.ExecutablePath "CommandLineEventConsumer$(if($hit){" ('$hit')"})" '' '' -Score $(if($hit){30}else{15}) -Confidence High
+        }
+    } catch {}
+    foreach ($t in (Get-ScheduledTask -EA SilentlyContinue)) { foreach ($a in $t.Actions) { if ($a.Execute -match '\\AppData\\|\\Temp\\|\\Downloads\\') { Add-Finding Review 'Scheduled task' $t.TaskName $a.Execute "Task runs from a user-writable path ($($t.State))" '' '' -Score 12 -Confidence Medium } } }
+}
+try { Get-PersistenceDeep; Set-Phase 'Persistence' 'Completed' } catch { Write-AuditError -Record $_ -Stage 'Persistence'; Set-Phase 'Persistence' 'Partial' }
 
 foreach ($c in (Get-NetTCPConnection -State Listen -EA SilentlyContinue)) {
     if ($c.LocalAddress -notin @('127.0.0.1','::1','0.0.0.0','::')) { continue }
@@ -1492,6 +2106,25 @@ if (Test-Path $pfDir) {
         $base = ($f.Name -split '-')[0]
         $ts = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
         $pfAll.Add("$ts | $base"); $timeline.Add("$ts | PREFETCH | $base")
+
+        # Parse the file body: real full path, run count, last run times, loaded cheat DLLs.
+        $body = try { [SA.PF]::Read($f.FullName) } catch { $null }
+        $loaded = @()
+        if ($body -and $body.Length -ge 0xD8) {
+            $sOff = [BitConverter]::ToInt32($body,0x64); $sLen = [BitConverter]::ToInt32($body,0x68)
+            if ($sOff -gt 0 -and $sLen -gt 0 -and ($sOff+$sLen) -le $body.Length) {
+                foreach ($sp in ([Text.Encoding]::Unicode.GetString($body,$sOff,$sLen) -split "`0")) {
+                    if (-not $sp) { continue }
+                    $leaf = [IO.Path]::GetFileName($sp)
+                    if ($leaf -eq 'RobloxPlayerExecutor.dll' -or $leaf -eq 'WaveUIAuth.dll') { $loaded += $leaf }
+                    elseif ($leaf -match '\.(exe|dll|sys)$' -and (Get-CheatNameMatch $leaf)) { $loaded += $leaf }
+                }
+            }
+            foreach ($dl in ($loaded | Select-Object -Unique)) {
+                $Stats.DeepArtifacts++
+                Add-Finding Detected 'Prefetch load' $base $pfDir "Prefetch records loading $dl at startup" $ts 'Loader pulled in a cheat module' -Score 35 -Confidence High -Timeline @($ts)
+            }
+        }
         $hit = Get-KeywordMatch $base; if (-not $hit) { continue }
         $strong = Test-StrongKeyword $base
         Add-Finding $(if ($strong) { 'Detected' } else { 'Review' }) 'Execution history' $f.Name $pfDir "Prefetch shows execution ($hit)" $ts 'Delete only this .pf' -Score $(if ($strong) { 28 } else { 15 }) -Confidence High -Timeline @($ts)
@@ -1570,7 +2203,8 @@ foreach ($root in @((Join-Path $env:USERPROFILE 'Downloads'), ([Environment]::Ge
         $zone = Get-Item -LiteralPath $f.FullName -Stream * -EA SilentlyContinue | Where-Object { $_.Stream -eq 'Zone.Identifier' }
         if ($zone) { $z = Get-Content -LiteralPath $f.FullName -Stream Zone.Identifier -EA SilentlyContinue }
         if ($z) { $hu = ($z | Where-Object { $_ -match '^HostUrl=' }) -replace '^HostUrl=',''; $hit = Get-KeywordMatch "$hu $($f.Name)"; if ($hit -and $hu -match 'https?://') { Add-Finding Review 'Download origin' $f.Name $f.FullName "Downloaded from a cheat host ($hit): $hu" $ts 'Review the source' -Score 20 -Confidence Medium -Timeline @($ts) } }
-        $nh = Get-KeywordMatch $f.Name; if ($nh) { Add-Finding Review 'Download name' $f.Name $f.FullName "Filename matches '$nh'" $ts '' -Score 12 -Confidence Low }
+        $nh = Get-CheatNameMatch $f.Name; if (-not $nh) { $nh = Get-KeywordMatch $f.Name }
+        if ($nh) { Add-Finding Review 'Download name' $f.Name $f.FullName "Filename matches '$nh'" $ts '' -Score 12 -Confidence Low }
     }
 }
 Set-Phase 'Downloads' 'Completed'
@@ -1777,6 +2411,172 @@ if (-not $NoReputation) {
 } else { Set-Phase 'SRUM' 'Skipped' }
 
 # ============================================================================
+# 11b. Deep artifacts: PCA, Defender history, ShellBags, jump lists, service memory
+# ============================================================================
+Set-AuditProgress 80 'Self-audit' 'Parsing PCA, Defender history, ShellBags, jump lists, service memory...'
+Write-Host "`n=== Deep artifacts ===" -ForegroundColor Magenta
+
+# Program Compatibility Assistant launch logs (Windows 11 22H2+). Records every executable
+# Windows tried to start, independent of Prefetch and BAM.
+try {
+    $pcaDir = Join-Path $WinRoot 'appcompat\pca'
+    $pcaSeen = @{}
+    $dic = Join-Path $pcaDir 'PcaAppLaunchDic.txt'
+    if (Test-Path $dic) {
+        foreach ($line in (Get-Content -LiteralPath $dic -EA SilentlyContinue)) {
+            $bar = $line.LastIndexOf('|'); if ($bar -le 0) { continue }
+            $path = $line.Substring(0,$bar).Trim(); if (-not $path -or $path.Length -lt 4) { continue }
+            if ($pcaSeen.ContainsKey($path)) { continue }; $pcaSeen[$path] = 1
+            $Stats.DeepArtifacts++
+            $leaf = [IO.Path]::GetFileName($path)
+            $hit = Get-CheatNameMatch $leaf; if (-not $hit) { $hit = Get-KeywordMatch $leaf }
+            if ($hit) { Add-Finding $(if (Test-Path -LiteralPath $path) { 'Review' } else { 'Detected' }) 'PCA launch log' $leaf $path "PCA launch record$(if(-not (Test-Path -LiteralPath $path)){', file deleted'}) ('$hit')" $line.Substring($bar+1).Trim() 'Survives deletion' -Score 22 -Confidence High }
+        }
+    }
+    foreach ($db in @('PcaGeneralDb0.txt','PcaGeneralDb1.txt')) {
+        $p = Join-Path $pcaDir $db
+        if (-not (Test-Path $p)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $p -Encoding Unicode -EA SilentlyContinue)) {
+            $f = $line.Split('|'); if ($f.Length -lt 3) { continue }
+            $path = $f[2].Trim(); if (-not $path -or $pcaSeen.ContainsKey($path)) { continue }; $pcaSeen[$path] = 1
+            $Stats.DeepArtifacts++
+            $leaf = [IO.Path]::GetFileName($path)
+            $hit = Get-CheatNameMatch $leaf; if (-not $hit) { $hit = Get-KeywordMatch $leaf }
+            if ($hit) { Add-Finding $(if (Test-Path -LiteralPath $path) { 'Review' } else { 'Detected' }) 'PCA launch log' $leaf $path "PCA launch record ('$hit')" $f[0].Trim() 'Survives deletion' -Score 22 -Confidence High }
+        }
+    }
+    Set-Phase 'PCA' 'Completed'
+} catch { Set-Phase 'PCA' 'Failed' }
+
+# Defender MPLog and DetectionHistory: both survive clearing Protection History.
+try {
+    $defRoot = Join-Path $env:ProgramData 'Microsoft\Windows Defender'
+    $defSeen = @{}
+    $threatRx = '\b(HackTool|Trojan|PUA|PUADlManager|PUABundler|Exploit|VirTool|Behavior|Tool)[A-Za-z]*:[A-Za-z0-9]+/[A-Za-z0-9_.!\-]+'
+    $sup = Join-Path $defRoot 'Support'
+    if (Test-Path $sup) {
+        foreach ($log in (Get-ChildItem $sup -Filter 'MPLog-*.log' -EA SilentlyContinue)) {
+            $fs = try { [IO.File]::Open($log.FullName,'Open','Read','ReadWrite -bor Delete') } catch { $null }
+            if (-not $fs) { continue }
+            try {
+                $buf = New-Object byte[] ([Math]::Min($fs.Length, 32MB)); $null = $fs.Read($buf,0,$buf.Length)
+                $txt = [Text.Encoding]::UTF8.GetString($buf)
+            } finally { $fs.Dispose() }
+            foreach ($line in ($txt -split "`n")) {
+                if ($line -notmatch 'DETECTION|Threat') { continue }
+                $tm = [regex]::Match($line, $threatRx); if (-not $tm.Success) { continue }
+                $pm = [regex]::Match($line, '[A-Za-z]:\\[^\r\n\t"<>|?*\x00]{2,240}\.(?:exe|dll|sys|zip|rar|7z|lua|ps1|bat|py)')
+                $path = if ($pm.Success) { $pm.Value } else { '' }
+                if (-not $defSeen.ContainsKey($tm.Value + '|' + $path)) {
+                    $defSeen[$tm.Value + '|' + $path] = 1
+                    $Stats.DeepArtifacts++
+                    $leaf = if ($path) { [IO.Path]::GetFileName($path) } else { $tm.Value }
+                    $isCheat = ($tm.Value -match 'HackTool|VirTool') -or ($path -match 'roblox') -or (Get-CheatNameMatch $leaf)
+                    if ($isCheat) { Add-Finding Detected 'Defender history' $leaf $path "MPLog detection: $($tm.Value)" '' '' -Score 30 -Confidence High }
+                }
+            }
+        }
+    }
+    $dh = Join-Path $defRoot 'Scans\History\Service\DetectionHistory'
+    if (Test-Path $dh) {
+        foreach ($file in (Get-ChildItem $dh -Recurse -File -EA SilentlyContinue)) {
+            $raw = try { [IO.File]::ReadAllBytes($file.FullName) } catch { $null }; if (-not $raw) { continue }
+            $t = [Text.Encoding]::Unicode.GetString($raw)
+            $tm = [regex]::Match($t, $threatRx); if (-not $tm.Success) { continue }
+            $pm = [regex]::Match($t, '[A-Za-z]:\\[^\r\n\t"<>|?*\x00]{2,240}\.(?:exe|dll|sys|zip|rar|7z|lua)')
+            $path = if ($pm.Success) { $pm.Value } else { '' }
+            if ($defSeen.ContainsKey($tm.Value + '|' + $path)) { continue }; $defSeen[$tm.Value + '|' + $path] = 1
+            $Stats.DeepArtifacts++
+            $leaf = if ($path) { [IO.Path]::GetFileName($path) } else { $tm.Value }
+            if (($tm.Value -match 'HackTool|VirTool') -or ($path -match 'roblox') -or (Get-CheatNameMatch $leaf)) { Add-Finding Detected 'Defender history' $leaf $path "DetectionHistory record: $($tm.Value) ($($file.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))" '' '' -Score 30 -Confidence High }
+        }
+    }
+    Set-Phase 'Defender history' 'Completed'
+} catch { Set-Phase 'Defender history' 'Failed' }
+
+# ShellBags: folders opened in Explorer, kept after the folder itself is gone.
+try {
+    $bagRoot = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU'
+    if (Test-Path $bagRoot) {
+        $bagSeen = @{}
+        function Walk-Bag {
+            param($Key,[string]$Parent,[int]$Depth)
+            if ($Depth -gt 8) { return }
+            foreach ($sub in $Key.GetSubKeyNames()) {
+                $item = $Key.GetValue($sub)
+                $name = $null
+                if ($item -is [byte[]] -and $item.Length -ge 4) {
+                    $type = $item[2] -band 0x70
+                    if ($type -eq 0x30) {
+                        $end = 14; while ($end -lt $item.Length -and $item[$end] -ne 0) { $end++ }
+                        if ($end -gt 14) { $name = [Text.Encoding]::Default.GetString($item,14,$end-14) }
+                    }
+                }
+                $path = if ($name) { if ($Parent) { "$Parent\$name" } else { $name } } else { $Parent }
+                if ($name -and -not $bagSeen.ContainsKey($path)) {
+                    $bagSeen[$path] = 1; $Stats.DeepArtifacts++
+                    $hit = Get-CheatNameMatch $name; if (-not $hit) { $hit = Get-KeywordMatch $name }
+                    if ($hit) { Add-Finding Review 'ShellBags' $name $path "Folder opened in Explorer ('$hit')" '' '' -Score 18 -Confidence Medium }
+                }
+                try { $ck = $Key.OpenSubKey($sub); if ($ck) { Walk-Bag $ck $path ($Depth+1); $ck.Close() } } catch {}
+            }
+        }
+        $rk = Get-Item $bagRoot
+        Walk-Bag $rk '' 0
+        Set-Phase 'ShellBags' 'Completed'
+    } else { Set-Phase 'ShellBags' 'Failed' }
+} catch { Set-Phase 'ShellBags' 'Failed' }
+
+# Jump lists: files opened through taskbar/start lists.
+try {
+    $recent = [Environment]::GetFolderPath('Recent')
+    $jlSeen = @{}
+    foreach ($sub in @('AutomaticDestinations','CustomDestinations')) {
+        $d = Join-Path $recent $sub; if (-not (Test-Path $d)) { continue }
+        foreach ($f in (Get-ChildItem $d -File -EA SilentlyContinue)) {
+            $raw = try { [IO.File]::ReadAllBytes($f.FullName) } catch { $null }; if (-not $raw) { continue }
+            $t = [Text.Encoding]::Unicode.GetString($raw)
+            foreach ($m in [regex]::Matches($t,'[A-Za-z]:\\[^\x00-\x1F"<>|]{4,240}\.(exe|dll|lua|zip|rar|7z)')) {
+                $p = $m.Value; if ($jlSeen.ContainsKey($p)) { continue }; $jlSeen[$p] = 1
+                $Stats.DeepArtifacts++
+                $leaf = [IO.Path]::GetFileName($p)
+                $hit = Get-CheatNameMatch $leaf; if (-not $hit) { $hit = Get-KeywordMatch $leaf }
+                if ($hit) { Add-Finding Review 'Jump list' $leaf $p "Jump-list entry ('$hit')" $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm') '' -Score 15 -Confidence Medium }
+            }
+        }
+    }
+    Set-Phase 'Jump lists' 'Completed'
+} catch { Set-Phase 'Jump lists' 'Failed' }
+
+# Executable paths left in the memory of DPS, PcaSvc and Explorer.
+try {
+    $svcTargets = @()
+    foreach ($svc in @('DPS','PcaSvc')) { $s = Get-CimInstance Win32_Service -Filter ("Name = '{0}'" -f $svc) -EA SilentlyContinue; if ($s -and $s.ProcessId -gt 0) { $svcTargets += $s.ProcessId } }
+    foreach ($e in (Get-Process explorer -EA SilentlyContinue)) { $svcTargets += $e.Id }
+    $memSeen = @{}
+    foreach ($tp2 in $svcTargets) {
+        try {
+            foreach ($r2 in @([SA.N]::Regions($tp2, 4000))) {
+                if ($r2.Size -lt 0x1000 -or $r2.Size -gt 0x4000000) { continue }
+                $h2 = [SA.N]::OpenProcess(0x410,$false,[uint32]$tp2); if ($h2 -eq [IntPtr]::Zero) { break }
+                try { $buf = [SA.N]::ReadMem($h2,$r2.Base,[int]$r2.Size) } finally { [SA.N]::CloseHandle($h2) | Out-Null }
+                if (-not $buf) { continue }
+                foreach ($m in [regex]::Matches([Text.Encoding]::Unicode.GetString($buf),'[A-Za-z]:\\[^\x00-\x1F"<>|*?:]{2,200}\.exe')) {
+                    $p = $m.Value
+                    if ($p.ToLower().StartsWith($WinRoot.ToLower() + 'system32') -or $p.ToLower().StartsWith($WinRoot.ToLower() + 'syswow64')) { continue }
+                    if ($memSeen.ContainsKey($p)) { continue }; $memSeen[$p] = 1
+                    $Stats.DeepArtifacts++
+                    $leaf = [IO.Path]::GetFileName($p)
+                    $hit = Get-CheatNameMatch $leaf; if (-not $hit) { $hit = Get-KeywordMatch $leaf }
+                    if ($hit) { Add-Finding Review 'Service memory' $leaf $p "Path held in service memory ('$hit')" '' '' -Score 20 -Confidence Medium }
+                }
+            }
+        } catch {}
+    }
+    Set-Phase 'Service memory' 'Completed'
+} catch { Set-Phase 'Service memory' 'Failed' }
+
+# ============================================================================
 # 12. Misc
 # ============================================================================
 $hist = Join-Path $env:APPDATA 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
@@ -1801,7 +2601,7 @@ if ($Shots -and -not $NoShots) {
 # 13. Live watch
 # ============================================================================
 $LiveStart = Get-Date
-$MonStats = @{ Proc=0; File=0; Drv=0; Svc=0; Pipe=0; List=0; Conn=0; Autorun=0; Deep=0 }
+$MonStats = @{ Proc=0; File=0; Drv=0; Svc=0; Pipe=0; List=0; Conn=0; Autorun=0; Deep=0; Wd=0; Hw=0; Inj=0; Input=0 }
 $MonLog = Join-Path $OutDir 'live_monitor.log'
 function Write-Mon { param([string]$M,[ConsoleColor]$C='DarkGray'); $l = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$M; Add-Content -LiteralPath $MonLog -Value $l -Encoding UTF8 -EA SilentlyContinue; Write-Host $l -ForegroundColor $C }
 
@@ -1839,12 +2639,93 @@ function Live-Proc {
         }
     }
 }
+
+# Sub-second process watchdog: everything the 2 s poll above cannot see, with lineage and lifetime.
+function Live-Watchdog {
+    foreach ($w in [SA.WD]::Drain()) {
+        $MonStats.Wd++
+        $low = $w.Name.ToLower()
+        $ignored = ($LiveProcIgnore -contains $low) -or ($LiveProcIgnore -contains ($low -replace '\.exe$',''))
+        $life = if ($w.HasExited) { [Math]::Round($w.LifetimeMs) } else { -1 }
+        $lifeTxt = if ($w.HasExited) { "${life}ms" } else { "running" }
+        $hit = Get-CheatNameMatch $w.Name; if (-not $hit) { $hit = Get-KeywordMatch $w.Name }
+        $strong = Test-StrongKeyword $w.Name
+        $sig = if ($w.Path) { (Get-SigVerdict $w.Path).Verdict } else { 'Missing' }
+        $fromTemp = [bool]($w.Path -match '\\(Temp|Downloads|AppData)\\' -or $w.Path -match '\\AppData\\')
+        if ($ignored -and -not $hit -and -not ($life -ge 0 -and $life -lt 1200)) { continue }
+
+        Write-Mon "WD: $($w.Name) (PID $($w.Pid)) $lifeTxt sig=$sig path=$($w.Path)" $(if ($hit) { 'Yellow' } else { 'DarkGray' })
+        if ($w.Ancestry) { Write-Mon "  chain: $($w.Ancestry)" DarkGray }
+        if ($w.OriginCmd) { Write-Mon "  origin: $($w.OriginName) -> $($w.OriginCmd)" DarkGray }
+
+        $evidence = @()
+        if ($w.Ancestry) { $evidence += "Chain: $($w.Ancestry)" }
+        if ($w.OriginCmd) { $evidence += "Origin cmd: $($w.OriginCmd)" }
+        if ($w.Cmd) { $evidence += "Cmd: $($w.Cmd)" }
+        if ($w.Path) { $evidence += "Path: $($w.Path)" }
+
+        if ($strong -or ($hit -and $fromTemp)) {
+            Add-Finding Detected 'Live watchdog' $w.Name "PID $($w.Pid)" "$(if($hit){"Cheat name '$hit'"})$(if($fromTemp){', user-writable path'}), $lifeTxt, sig $sig" '' 'Short-lived loader' -Score $(if($fromTemp){65}else{50}) -Confidence High -Evidence $evidence
+        } elseif ($life -ge 0 -and $life -lt 1200 -and -not $ignored) {
+            Add-Finding Review 'Live watchdog' $w.Name "PID $($w.Pid)" "Process lived $lifeTxt and exited, sig $sig" '' 'Ephemeral - injector signature' -Score 25 -Confidence Medium -Evidence $evidence
+        } elseif ($hit) {
+            Add-Finding Review 'Live watchdog' $w.Name "PID $($w.Pid)" "Name matches '$hit', $lifeTxt, sig $sig" '' '' -Score 20 -Confidence Medium -Evidence $evidence
+        } elseif ($fromTemp -and $sig -ne 'Valid' -and -not $ignored) {
+            Add-Finding Review 'Live watchdog' $w.Name "PID $($w.Pid)" "Unsigned binary from a user-writable path" '' '' -Score 18 -Confidence Medium -Evidence $evidence
+        }
+
+        # A program that lists processes on a timer is a cheat watchdog hiding from screenshare tools
+        if ($ProcessListTools -contains $low -and $w.OriginName -and $w.OriginName -ne 'SelfAudit') {
+            $key = "poll|$($w.OriginName)"
+            $n = [int]$script:PollCounts[$key] + 1
+            $script:PollCounts[$key] = $n
+            if ($n -eq 5) { Add-Finding Review 'Process polling' "$($w.OriginName) polls the process list" "$($w.OriginName)" "Ran $low 5 times in the watch window" '' 'Watchdog-hiding tell' -Score 20 -Confidence Medium -Evidence @("Origin: $($w.OriginName)") }
+        }
+    }
+}
+
+# Continuous handle watchdog on Roblox, with per-owner injection state.
+function Live-Handles {
+    foreach ($h in [SA.HW]::Drain()) {
+        $MonStats.Hw++
+        if ($h.OwnerName -eq 'RobloxCrashHandler') { continue }
+        $sv = $h.Sig
+        $allow = ($HandleOwnerAllowlist -contains $h.OwnerName) -and $sv -ne 'Signed'
+        $inj = $h.Injection
+        if ($inj) { $MonStats.Inj++ }
+        Write-Mon "HANDLE: $($h.OwnerName) (PID $($h.OwnerPid)) $($h.AccessDesc) sig=$sv $(if($inj){"INJ: $inj"})" $(if($inj){'Red'}else{'Yellow'})
+        $ev = @("Access: $($h.AccessDesc)", "Signature: $sv")
+        if ($inj) { $ev += "Injection: $inj" }
+        if ($allow) { Add-Finding Detected 'Live handle' "$($h.OwnerName) (identity mismatch)" $h.OwnerPath "Trusted name, signature $sv [$($h.AccessDesc)]$(if($inj){" | $inj"})" '' 'Renamed binary reading Roblox' -Score $(if($inj){75}else{55}) -Confidence High -Evidence $ev }
+        else { Add-Finding Detected 'Live handle' "$($h.OwnerName) (PID $($h.OwnerPid))" $h.OwnerPath "Handle to Roblox mid-session: $($h.AccessDesc) [sig: $sv]$(if($inj){" | $inj"})" '' 'Reader appeared during the session' -Score $(if($inj){60}else{35}) -Confidence $(if($inj){'High'}else{'Medium'}) -Evidence $ev }
+    }
+}
+
+# Injected input reaching Roblox. Reported once per severity level change.
+function Live-Input {
+    if (-not $script:IM) { return }
+    $s = $script:IM.Snapshot()
+    $lvl = if ($s['detected']) { 'detected' } elseif ($s['review']) { 'review' } else { 'none' }
+    if ($lvl -eq $script:InputLevel) { return }
+    $script:InputLevel = $lvl
+    $counts = "$($s['injectedMoves']) injected moves, $($s['injectedClicks']) injected clicks"
+    if ($lvl -eq 'detected') {
+        $MonStats.Input++
+        Write-Mon "INPUT: $counts" Red
+        Add-Finding Detected 'Input injection' 'Injected mouse input in Roblox' 'WH_MOUSE_LL' "Software is moving or clicking the mouse: $counts" '' 'Colorbot / aim script, even if renamed' -Score 55 -Confidence High -Evidence @($counts)
+    } elseif ($lvl -eq 'review') {
+        $MonStats.Input++
+        Write-Mon "INPUT: $counts" Yellow
+        Add-Finding Review 'Input injection' 'Injected mouse input in Roblox' 'WH_MOUSE_LL' "Some software input reached Roblox: $counts" '' '' -Score 20 -Confidence Medium -Evidence @($counts)
+    }
+}
+
 function Live-File {
     foreach ($d in $watchDirs) { if (-not (Test-Path $d)) { continue }
         foreach ($f in (Get-ChildItem $d -File -EA SilentlyContinue)) {
             if (-not $kFiles.Add($f.FullName)) { continue }
             if ($watchExt -notcontains $f.Extension.ToLower()) { continue }
-            $MonStats.File++; $hit = Get-KeywordMatch $f.Name
+            $MonStats.File++; $hit = Get-CheatNameMatch $f.Name; if (-not $hit) { $hit = Get-KeywordMatch $f.Name }
             Write-Mon "New file: $($f.FullName)$(if($hit){" [keyword: $hit]"})"
             if ($hit) { Add-Finding Detected 'Live file' $f.Name $f.FullName "Appeared during session, name matches '$hit'" $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm') '' -Score 30 -Confidence Medium }
             if ($f.Extension -in '.exe','.dll','.sys') { Invoke-BinaryEvaluation -Name $f.Name -Path $f.FullName -Source 'Live file' }
@@ -1885,33 +2766,49 @@ function Live-Mod {
     foreach ($rp in @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' })) { try { foreach ($m in $rp.Modules) { if (-not (Test-SeenOnce "lm|$($m.FileName)")) { continue }; $s = Get-SigVerdict $m.FileName; $tr = $false; if ($s.Verdict -eq 'Valid') { foreach ($pu in $TrustedModulePublishers) { if ($s.Publisher -like "*$pu*") { $tr = $true; break } } }; Write-Mon "Roblox module: $($m.ModuleName) [$($m.FileName)] sig=$($s.Verdict)"; if (-not $tr) { Add-Finding Detected 'Live module' $m.ModuleName $m.FileName "Newly loaded into Roblox, signature $($s.Verdict)" '' 'Verify origin' -Score $(if ($m.FileName -match '\\(Temp|Downloads)\\') { 45 } else { 25 }) -Confidence Medium } } } catch {} }
 }
 
+$script:PollCounts = @{}
 if (-not $NoLive) {
     Set-AuditProgress 84 'Self-audit' 'Live watch starting...'
     Write-Host "`n=== Live monitoring ===" -ForegroundColor Magenta
-    Write-Host 'Watching process starts, drivers, services, new files, pipes, listeners and autoruns. Roblox is not required.' -ForegroundColor Gray
+    Write-Host 'Watching process starts (75 ms, with ancestry), Roblox handles, injected input, drivers, services, new files, pipes, listeners and autoruns. Roblox is not required.' -ForegroundColor Gray
     if ($LiveSeconds -gt 0) { Write-Host "Timed: ${LiveSeconds}s." -ForegroundColor Yellow } else { Write-Host 'Press ENTER to stop.' -ForegroundColor Yellow }
     Set-Content -LiteralPath $MonLog -Value "Live watch $($LiveStart.ToString('o'))" -Encoding UTF8 -EA SilentlyContinue
     Live-Baseline
+    try { [SA.WD]::Start(75) } catch { Write-Mon 'Watchdog unavailable' Yellow }
+    try { [SA.HW]::Start(150) } catch { Write-Mon 'Handle watchdog unavailable' Yellow }
+    try { $script:IM = [SA.IM]::new(); $script:IM.Start(); Write-Mon "Input monitor: $($script:IM.Status)" Cyan } catch { $script:IM = $null }
     $t1=[datetime]::MinValue; $t2=$t1; $t3=$t1; $t4=$t1; $t5=$t1; $t6=$t1; $lastStat=$t1
-    while ($true) {
-        if ([Console]::KeyAvailable) { if ([Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter) { break } }
-        if ((Get-Date) -ge $deadline) { break }
-        try { Live-Proc } catch { Write-AuditError -Record $_ -Stage 'Live proc' }
-        try { Live-File } catch { Write-AuditError -Record $_ -Stage 'Live file' }
-        if (((Get-Date)-$t1).TotalSeconds -ge 10) { try { Live-Drv } catch {}; $t1=Get-Date }
-        if (((Get-Date)-$t2).TotalSeconds -ge 10) { try { Live-Svc } catch {}; $t2=Get-Date }
-        if (((Get-Date)-$t3).TotalSeconds -ge 5)  { try { Live-Pipe } catch {}; $t3=Get-Date }
-        if (((Get-Date)-$t4).TotalSeconds -ge 10) { try { Live-Net } catch {}; $t4=Get-Date }
-        if (((Get-Date)-$t5).TotalSeconds -ge 15) { try { Live-Auto } catch {}; $t5=Get-Date }
-        if (((Get-Date)-$t6).TotalSeconds -ge 5)  { try { Live-Mod } catch {}; $t6=Get-Date }
-        try { Send-Partial 'watch' } catch {}
-        if (((Get-Date)-$lastStat).TotalSeconds -ge 10) { $rp = @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' }); Write-Host ("[WATCH] {0}p {1}f {2}d {3}n | Roblox: {4}" -f $MonStats.Proc,$MonStats.File,$MonStats.Drv,($MonStats.List+$MonStats.Conn),$(if($rp.Count){'running'}else{'idle'})) -ForegroundColor DarkCyan; $lastStat=Get-Date }
-        Start-Sleep -Seconds $Config.LivePollSeconds
+    try {
+        while ($true) {
+            if ([Console]::KeyAvailable) { if ([Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter) { break } }
+            if ((Get-Date) -ge $deadline) { break }
+            try { Live-Watchdog } catch { Write-AuditError -Record $_ -Stage 'Live watchdog' }
+            try { Live-Handles } catch { Write-AuditError -Record $_ -Stage 'Live handles' }
+            try { Live-Input } catch { Write-AuditError -Record $_ -Stage 'Live input' }
+            try { Live-Proc } catch { Write-AuditError -Record $_ -Stage 'Live proc' }
+            try { Live-File } catch { Write-AuditError -Record $_ -Stage 'Live file' }
+            if (((Get-Date)-$t1).TotalSeconds -ge 10) { try { Live-Drv } catch {}; $t1=Get-Date }
+            if (((Get-Date)-$t2).TotalSeconds -ge 10) { try { Live-Svc } catch {}; $t2=Get-Date }
+            if (((Get-Date)-$t3).TotalSeconds -ge 5)  { try { Live-Pipe } catch {}; $t3=Get-Date }
+            if (((Get-Date)-$t4).TotalSeconds -ge 10) { try { Live-Net } catch {}; $t4=Get-Date }
+            if (((Get-Date)-$t5).TotalSeconds -ge 15) { try { Live-Auto } catch {}; $t5=Get-Date }
+            if (((Get-Date)-$t6).TotalSeconds -ge 5)  { try { Live-Mod } catch {}; $t6=Get-Date }
+            try { Send-Partial 'watch' } catch {}
+            if (((Get-Date)-$lastStat).TotalSeconds -ge 10) { $rp = @(Get-Process -EA SilentlyContinue | Where-Object { $_.ProcessName -eq 'RobloxPlayerBeta' }); Write-Host ("[WATCH] {0}p {1}wd {2}h {3}inj {4}f | Roblox: {5}" -f $MonStats.Proc,$MonStats.Wd,$MonStats.Hw,$MonStats.Inj,$MonStats.File,$(if($rp.Count){'running'}else{'idle'})) -ForegroundColor DarkCyan; $lastStat=Get-Date }
+            Start-Sleep -Seconds $Config.LivePollSeconds
+        }
+    } finally {
+        try { [SA.WD]::Stop() } catch {}
+        try { [SA.HW]::Stop() } catch {}
+        try { if ($script:IM) { $script:IM.Dispose() } } catch {}
+        # Drain anything queued after the last tick
+        try { Live-Watchdog } catch {}
+        try { Live-Handles } catch {}
     }
     Write-Mon 'Live watch stopped.' Cyan
-    Set-Phase 'Live monitoring' 'Completed' ("{0}s, {1} proc, {2} file" -f [int]((Get-Date)-$LiveStart).TotalSeconds, $MonStats.Proc, $MonStats.File)
+    Set-Phase 'Live monitoring' 'Completed' ("{0}s, {1} proc, {2} watchdog, {3} handle, {4} injected" -f [int]((Get-Date)-$LiveStart).TotalSeconds, $MonStats.Proc, $MonStats.Wd, $MonStats.Hw, $MonStats.Inj)
 } else { Set-Phase 'Live monitoring' 'Skipped' }
-$Meta['live'] = @{ durationSeconds = [int]((Get-Date)-$LiveStart).TotalSeconds; stats = $MonStats }
+$Meta['live'] = @{ durationSeconds = [int]((Get-Date)-$LiveStart).TotalSeconds; stats = $MonStats; inputMonitor = $(if ($script:IM) { $script:IM.Status } else { 'not started' }) }
 
 # ============================================================================
 # 14. Correlation
