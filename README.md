@@ -18,61 +18,19 @@ Optional third-party tools are fetched on demand into `%LOCALAPPDATA%\SelfAudit\
 
 ---
 
-## Quick start:
+## How to use
 
-Fork the repo and add a webhook first ([Webhook setup](#webhook-setup)). Then run this in `cmd` — it downloads the script to a temp directory and relaunches it elevated.
+A Discord webhook URL is the only delivery target. There is no fallback in this repo, there are many ways you can send the file to the webhook, but for my sake and yours here is the simplest one:
 
-```
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$u='https://raw.githubusercontent.com/YOURNAME/YOURFORK/refs/heads/main/SelfAudit.ps1';$d=Join-Path $env:TEMP ('SelfAudit-'+[guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $d -Force|Out-Null;$p=Join-Path $d 'SelfAudit.ps1';Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if(-not(Test-Path $p)){throw 'Download failed'};Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $p + '"'),'-LiveSeconds','45','-Shots','-HideDetails')"
-```
-
-That runs a 7-day lookback, a 45-second live watch, captures screenshots, and hides technical console output.
-
----
-
-## Webhook setup
-
-A Discord webhook URL is the only delivery target. There is no fallback in this repo, so pick one of the two options below.
-
-### Option A — fork, and use your own `WebhookUrl.txt`
-
-Most convenient for repeat use: the webhook lives in your fork and the command stays clean.
-
-1. Sign in to GitHub and open this repo.
-2. **Fork** → **Create fork**. Public is fine and simplest — `raw.githubusercontent.com` serves public repos without auth. The tradeoff is that your webhook becomes publicly readable, exactly like this repo's *used* to be.
-3. In **your fork**, **Add file** → **Create new file**. Filename `WebhookUrl.txt`. Content: your webhook URL on one line, bare, no `?wait=true`. Commit to `main`.
-4. Still in your fork, open `SelfAudit.ps1` and edit this line near the top:
-
-```powershell
-$RepoBase = 'https://raw.githubusercontent.com/zerythh/selfaudit/refs/heads/main'
-```
-
-   to point at your fork:
-
-```powershell
-$RepoBase = 'https://raw.githubusercontent.com/YOURNAME/YOURFORK/refs/heads/main'
-```
-
-   Commit. This line only feeds the webhook lookup, so nothing else changes behavior.
-   
-5. Use your fork's raw script URL in the command — `$u='https://raw.githubusercontent.com/YOURNAME/YOURFORK/refs/heads/main/SelfAudit.ps1'`.
-6. Run once and confirm the zip lands in your channel.
-
-When you sync your fork with upstream later, re-check step 4. A sync can overwrite that line.
-
-### Option B — fork only to host the file
-
-If you'd rather not maintain a modified script, fork and add `WebhookUrl.txt` as in steps 1–3, then keep using the upstream script and pass your fork's raw URL:
+Inside the command line you would send to a suspected cheater, add a `-Webhook`
 
 ```
-...,'-HideDetails','-WebhookFile','https://raw.githubusercontent.com/YOURNAME/YOURFORK/refs/heads/main/WebhookUrl.txt')"
+...,'-HideDetails','-Webhook','https://discord.com/api/webhooks/.../..."
 ```
 
-`-WebhookFile` takes a URL or a local path. The webhook stays out of the command line, and updating upstream is a plain sync with no conflicts.
+`-Webhook` takes a URL.
 
-If you download the repo as a folder and run the `.ps1` in place, a `WebhookUrl.txt` sitting next to it is picked up automatically with no flag at all.
-
-Or skip hosting entirely and pass it directly with `-Webhook`. Highest priority, but the URL then sits in the paste and in the process command line.
+Highest priority, but the URL then sits in the paste and in the process command line. The webhook should then be treated as fully compromised, (all info inside can be deleted, which is a real concern) so once the check has concluded, download/forward the final results.
 
 ---
 
@@ -166,3 +124,6 @@ So a run that gets interrupted still leaves evidence somewhere durable.
 
 **The upload failed.**
 The archive is kept and the path printed. Check in order: no webhook configured at all, a revoked or wrong webhook, or an archive over the size limit — lower `-MaxUploadMB` so the text-only fallback kicks in.
+
+**Does Command Prompt need to be ran as administrator?**
+Running as administrator is required for most checks, however, if ran without it, it auto elevates and shows a UAC prompt to the user.
